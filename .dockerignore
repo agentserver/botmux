@@ -38,16 +38,13 @@ build/
 electron-builder.yml
 src/desktop/
 
-# Tests
-test/
+# Tests (test/ 目录保留：audit:domains 构建步骤需要遍历它)
 vitest.config.ts
 storageState.json
 midscene_run/
 .playwright-mcp/
 
-# Docs & examples
-docs/
-docs-site/
+# Docs & examples (docs/ docs-site/ 保留：audit:domains 构建步骤需要遍历它们)
 gif/
 examples/
 cover.svg
