@@ -40,6 +40,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# ── AI CLI tools ──────────────────────────────────────────────────────────────
+# botmux 是桥接层，本身不包含 AI 能力。至少需要安装一个 CLI 才能工作。
+# 默认安装 Claude Code（npm 全局包），替换/追加见下方注释。
+RUN npm install -g @anthropic-ai/claude-code
+# 其他常见 CLI 安装方式（按需取消注释）：
+# RUN npm install -g @openai/codex          # Codex
+# RUN npm install -g @google/gemini-cli      # Gemini CLI
+# RUN npm install -g @anthropic-ai/aiden     # Aiden
+# RUN npm install -g opencode-ai/opencode    # OpenCode
+# RUN npm install -g cursor-talk             # Cursor CLI
+# RUN npm install -g @antigravity/cli        # Antigravity
+# RUN pip install kiro-cli                   # Kiro CLI (需要 python3-pip)
+
 # Create non-root user for daemon and CLI child processes
 RUN useradd --create-home --shell /bin/bash botmux
 
