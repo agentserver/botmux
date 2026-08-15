@@ -1,0 +1,66 @@
+# Dependencies (installed fresh in build)
+node_modules
+.pnpm-store/
+
+# Build output (built fresh in build)
+dist/
+packages/workflow-core/dist/
+packages/workflow-core/.packs/
+
+# Runtime data
+data/
+log/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# IDE & editor
+.idea/
+.vscode/
+*.tsbuildinfo
+.DS_Store
+
+# Environment files (mount your own at runtime)
+.env
+.npmrc
+
+# Claude / AI CLI configs (isolated per session at runtime)
+.claude/
+.codex/
+.antigravitycli/
+.cjadk/
+.trae/
+
+# Desktop app (not needed in container)
+build/
+electron-builder.yml
+src/desktop/
+
+# Tests
+test/
+vitest.config.ts
+storageState.json
+midscene_run/
+.playwright-mcp/
+
+# Docs & examples
+docs/
+docs-site/
+gif/
+examples/
+cover.svg
+
+# CI / platform infra (not part of the public image)
+/platform/
+/mcp-gateway/
+
+# Misc
+*.md
+.gitignore
+.npmignore
+.magic-token
+.magic-apps.json
+dashboard-substitute*.png
+tmux-client-*.log
