@@ -179,8 +179,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # 与 byted 镜像分开的仓库路径 agentserver/botmux-runtime，host 同为内网 vars.ICM_REGISTRY
-          images: ${{ vars.ICM_REGISTRY }}/agentserver/botmux-runtime
+          # 与 byted 镜像分开的仓库路径 agentserver/rtm-aihub，host 同为内网 vars.ICM_REGISTRY
+          images: ${{ vars.ICM_REGISTRY }}/agentserver/rtm-aihub
           # 与上游同一套 tag 规则（master / semver / sha），latest=auto
           flavor: |
             latest=auto
