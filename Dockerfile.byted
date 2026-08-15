@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1
+
+# botmux 内网工具变体（多阶段）：在 botmux base 之上追加
+#   - bkectl   —— 从 code.byted.org 克隆源码 `make build` 编译（Go 1.26，静态二进制）
+#   - bytedcli —— 从内网 npm registry(bnpm.byted.org) 全局安装
+#
+#   builder 阶段：克隆 + 编译 bkectl（linux 下 build.sh 自动 CGO_ENABLED=0）
+#   final   阶段：拷入 bkectl 二进制 + 装 bytedcli；不带 Go 工具链 / 源码 / 凭据
+#
+# ⚠️ 需内网构建：拉取 code.byted.org 私有仓 / Go module，以及 bnpm.byted.org npm 包。
+#    git 凭据通过 BuildKit secret 注入（不落 layer、不进 docker history）：
+#
+#      export CODE_BYTED_USERNAME=... CODE_BYTED_TOKEN=...
+#      docker buildx build -f Dockerfile.byted \
+#        --secret id=code_byted_username,env=CODE_BYTED_USERNAME \
+#        --secret id=code_byted_token,env=CODE_BYTED_TOKEN \
+#        --build-arg BASE_IMAGE=ghcr.io/agentserver/botmux:master \
+#        -t botmux-byted --load .
+#
+#    公共 Go 依赖默认走 proxy.golang.org；内网不可达时用 --build-arg GOPROXY=... 覆盖。
+
+ARG BASE_IMAGE=ghcr.io/agentserver/botmux:master
+ARG GO_IMAGE=golang:1.26-bookworm
+
+# ── Builder：克隆 + make build，产出静态 bkectl 二进制 ──────────────────────
+# --platform=$BUILDPLATFORM：在构建机原生架构上编译（CGO_ENABLED=0 纯静态，
+# 通过 GOARCH 交叉编译到目标架构，避免 QEMU 下跑 Go 编译器）。
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS bkectl-builder
+
+# buildx 自动注入的目标平台（普通 docker build 也会填当前平台）
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+# code.byted.org 依赖走 direct git（跳过公共 proxy 与 checksum db）
+ENV GOPRIVATE=code.byted.org
+# 公共依赖的 proxy，可 --build-arg 覆盖成内网 goproxy
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+
+ARG BKECTL_REPO=https://code.byted.org/bd-sre/bkectl
+ARG BKECTL_REF=master
+
+WORKDIR /workspace
+
+# 单个 RUN 内完成：注入凭据 → 克隆 → 交叉编译 → 清理凭据。
+# 凭据写进 /root/.git-credentials 供 git（clone + go 拉私有 module）使用，
+# RUN 结束前 rm 掉——最终 layer 里不含 token；secret 挂载本身也不进 layer。
+RUN --mount=type=secret,id=code_byted_username \
+    --mount=type=secret,id=code_byted_token \
+    set -eux; \
+    git config --global credential.helper store; \
+    printf 'https://%s:%s@code.byted.org\n' \
+      "$(cat /run/secrets/code_byted_username)" \
+      "$(cat /run/secrets/code_byted_token)" > /root/.git-credentials; \
+    git clone --depth 1 --branch "${BKECTL_REF}" "${BKECTL_REPO}" repo; \
+    cd repo; \
+    GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" make build; \
+    test -x output/bkectl; \
+    rm -f /root/.git-credentials /root/.gitconfig
+
+# ── Final：干净 botmux base + bkectl 二进制 + bytedcli ─────────────────────
+FROM ${BASE_IMAGE}
+
+# 落到系统 PATH（/usr/local/bin），root 与 botmux 用户都能直接调用。
+COPY --from=bkectl-builder /workspace/repo/output/bkectl /usr/local/bin/bkectl
+
+# base 镜像以 botmux 用户结束；全局 npm 装到 root 拥有的 /usr/local，需切回 root。
+USER root
+
+# bytedcli：从内网 npm registry 全局安装（bnpm.byted.org 为内网 http registry）
+RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g @bytedance-dev/bytedcli@latest \
+    && npm cache clean --force
+
+# 以运行身份校验两个工具可用。bkectl 跨架构构建时这一步在目标平台下执行
+# （buildx 经 QEMU 模拟），对每个目标架构都是真实验证；关掉自动更新避免触网。
+USER botmux
+RUN command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version
+
+# 继承 base 镜像的 botmux 用户、env、EXPOSE 与 CMD（无需重复声明）

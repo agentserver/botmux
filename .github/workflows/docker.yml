@@ -25,6 +25,9 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # 暴露刚推送镜像的 manifest digest，供下游 bkectl 镜像按不可变引用消费
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - uses: actions/checkout@v6
@@ -64,11 +67,81 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── byted 内网工具变体：以上一个 job 刚推送的 botmux 镜像为 base，追加 bkectl + bytedcli ──
+  # 跑在 k8s-sg 自建 runner 上——它能同时访问内网源（编译 bkectl / 装 bytedcli 所需的
+  # 内网 git 与 npm registry，具体地址见 Dockerfile.byted）、ghcr.io（拉 base 镜像）
+  # 与内网镜像仓（推产物，registry 地址由 vars.ICM_REGISTRY 提供，避免把内网 host
+  # 写进受 audit:domains 扫描的 .github/）。GitHub 托管 runner 连不上内网，故不可用。
+  build-and-push-byted:
+    needs: build-and-push
+    runs-on: k8s-sg
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 拉 base 镜像用（base 由上一个 job 推到 ghcr）
+      - name: Login to GitHub Container Registry (pull base)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 推产物用（内网镜像仓；host 由仓库变量提供，凭据走 secrets）
+      - name: Login to internal image registry (push byted image)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ICM_REGISTRY }}
+          username: ${{ secrets.ICM_USERNAME }}
+          password: ${{ secrets.ICM_PASSWORD }}
+
+      - name: Generate Docker metadata (tags / labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # 内网 registry host 来自 vars.ICM_REGISTRY，仓库路径 agentserver/botmux
+          images: ${{ vars.ICM_REGISTRY }}/agentserver/botmux
+          # 与 base 镜像同一套 tag 规则（master / semver / sha），latest=auto
+          flavor: |
+            latest=auto
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=sha,prefix=sha-
+
+      - name: Build and push byted image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.byted
+          # 单架构 = runner 原生架构：final 阶段的 `bkectl version` 原生执行，
+          # 无需 QEMU。如需多架构，另加 setup-qemu-action 并设 platforms。
+          push: true
+          # 以上一个 job 推送镜像的 manifest digest 作为 base——不可变、跟本次构建一一对应
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
+          # 内网私有仓 + Go module 的 git 凭据，经 BuildKit secret 注入（不落 layer）
+          secrets: |
+            code_byted_username=${{ secrets.CODE_BYTED_USERNAME }}
+            code_byted_token=${{ secrets.CODE_BYTED_TOKEN }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
