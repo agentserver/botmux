@@ -55,6 +55,8 @@ cover.svg
 
 # Misc
 *.md
+!README.md
+!README.en.md
 .gitignore
 .npmignore
 .magic-token
