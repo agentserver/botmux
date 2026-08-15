@@ -3,9 +3,10 @@
 # botmux 内网工具变体（多阶段）：在 botmux base 之上追加
 #   - bkectl   —— 从 code.byted.org 克隆源码 `make build` 编译（Go 1.26，静态二进制）
 #   - bytedcli —— 从内网 npm registry(bnpm.byted.org) 全局安装
+#   - lark-cli —— @larksuite/cli（飞书开放平台 CLI），亦从 bnpm 安装；原生二进制构建期烤入
 #
 #   builder 阶段：克隆 + 编译 bkectl（linux 下 build.sh 自动 CGO_ENABLED=0）
-#   final   阶段：拷入 bkectl 二进制 + 装 bytedcli；不带 Go 工具链 / 源码 / 凭据
+#   final   阶段：拷入 bkectl 二进制 + 装 bytedcli / lark-cli；不带 Go 工具链 / 源码 / 凭据
 #
 # ⚠️ 需内网构建：拉取 code.byted.org 私有仓 / Go module，以及 bnpm.byted.org npm 包。
 #    git 凭据通过 BuildKit secret 注入（不落 layer、不进 docker history）：
@@ -58,7 +59,7 @@ RUN --mount=type=secret,id=code_byted_username \
     test -x output/bkectl; \
     rm -f /root/.git-credentials /root/.gitconfig
 
-# ── Final：干净 botmux base + bkectl 二进制 + bytedcli ─────────────────────
+# ── Final：干净 botmux base + bkectl 二进制 + bytedcli / lark-cli ──────────
 FROM ${BASE_IMAGE}
 
 # 落到系统 PATH（/usr/local/bin），root 与 botmux 用户都能直接调用。
@@ -67,13 +68,28 @@ COPY --from=bkectl-builder /workspace/repo/output/bkectl /usr/local/bin/bkectl
 # base 镜像以 botmux 用户结束；全局 npm 装到 root 拥有的 /usr/local，需切回 root。
 USER root
 
-# bytedcli：从内网 npm registry 全局安装（bnpm.byted.org 为内网 http registry）
-RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g @bytedance-dev/bytedcli@latest \
-    && npm cache clean --force
+# 内网 npm 工具（全局装到 root 拥有的 /usr/local，registry 走内网 bnpm）：
+#   - bytedcli —— @bytedance-dev/bytedcli
+#   - lark-cli —— @larksuite/cli，飞书开放平台 CLI（rtm-aihub 的 document 技能建文档/查 wiki 用）
+# lark-cli 的 npm 包只是 launcher，原生二进制由其安装脚本经 curl 从 GitHub Release /
+# npmmirror 下载（base 不含 curl，这里补装）；构建期 `lark-cli --version` 触发首次下载，
+# 把二进制烤进本层——运行时无需 curl / 联网即可直接执行（npm 若拦截 postinstall 也不影响，
+# launcher 会在二进制缺失时自动下载，此步正是借这一路径预热）。
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
+      @bytedance-dev/bytedcli@latest \
+      @larksuite/cli@latest; \
+    lark-cli --version; \
+    npm cache clean --force
 
-# 以运行身份校验两个工具可用。bkectl 跨架构构建时这一步在目标平台下执行
+# 以运行身份校验工具可用。bkectl 跨架构构建时这一步在目标平台下执行
 # （buildx 经 QEMU 模拟），对每个目标架构都是真实验证；关掉自动更新避免触网。
+# lark-cli 执行已烤入的原生二进制，无需再联网。
 USER botmux
-RUN command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version
+RUN command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
+    && command -v lark-cli && lark-cli --version
 
 # 继承 base 镜像的 botmux 用户、env、EXPOSE 与 CMD（无需重复声明）

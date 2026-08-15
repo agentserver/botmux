@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1
+
+# botmux 运行时变体：在 byted 内网工具镜像之上装入 rtm-aihub（事故 oncall 套件）
+#   base   —— byted 变体镜像（已含 bkectl + bytedcli；rtm-aihub 的 tooling 每次
+#             节点排查都经 bkectl 登录节点，document 技能用 lark-cli 建飞书文档）
+#   rtm-aihub —— 事故 wiki + skills(check/incident/document/ingest/optimize)
+#             + Python tooling(scenario/playbook/component/wiki_lint/incidents_add)
+#
+#   本层做三件事：
+#     1. 装 python3 + venv（tooling 是 python3 脚本；base 运行时无 python3）
+#     2. venv 里装 tooling 的第三方依赖（cel-python / PyYAML），并置于 PATH 最前，
+#        使 skills 里的 `python3 tooling/*.py` 命中带依赖的解释器
+#     3. clone rtm-aihub 到会话默认工作目录并跑 setup.sh（生成 .claude/.codex/.trae
+#        的 skills 软链 + AGENTS.md），归属 botmux，供会话 cwd 落在此仓时自动发现技能
+#
+# ⚠️ 需内网构建：BASE_IMAGE 是内网仓镜像，rtm-aihub 亦在 code.byted.org 私有仓。
+#    git 凭据通过 BuildKit secret 注入（不落 layer、不进 docker history）：
+#
+#      export CODE_BYTED_USERNAME=... CODE_BYTED_TOKEN=...
+#      docker buildx build -f Dockerfile.runtime \
+#        --secret id=code_byted_username,env=CODE_BYTED_USERNAME \
+#        --secret id=code_byted_token,env=CODE_BYTED_TOKEN \
+#        --build-arg BASE_IMAGE=<byted 变体镜像:tag 或 @digest> \
+#        -t botmux-runtime --load .
+#
+#    公共 pip 包默认走 pypi.org；内网不可达时用 --build-arg PIP_INDEX_URL=<内网镜像> 覆盖。
+
+# base 必须是 byted 变体（含 bkectl + bytedcli），否则 rtm-aihub tooling 无法登录节点。
+ARG BASE_IMAGE=aliyun-sin-hub.byted.org/agentserver/botmux:master
+
+FROM ${BASE_IMAGE}
+
+ARG RTM_REPO=https://code.byted.org/tce/rtm-aihub
+ARG RTM_REF=main
+# 装到 base 的默认会话工作目录（WORKING_DIR=/home/botmux/projects）下，
+# 会话 cwd 落在此仓时，agent CLI 自动发现 .claude/.codex/.trae 下的 skills。
+ARG RTM_DIR=/home/botmux/projects/rtm-aihub
+
+# base 以 botmux 用户结束；装 apt / 建 venv / 克隆到系统目录都需 root。
+USER root
+
+# tooling 是 python3 脚本，base 运行时镜像不含 python3；git 已由 base 提供。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# 独立 venv 装第三方依赖，避免动 Debian 系统 python（PEP 668）。
+# --only-binary=:all:：强制用预编译 wheel——cel-python 的传递依赖含原生扩展
+# (google-re2 / pendulum)，本镜像无 C/C++ 工具链，宁可缺 wheel 时明确报错，
+# 也不静默拉进编译器。若目标架构缺 wheel，改用内网 PIP_INDEX_URL 或补构建依赖。
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+ENV RTM_VENV=/opt/rtm-aihub-venv
+RUN python3 -m venv "$RTM_VENV" \
+    && "$RTM_VENV/bin/pip" install --no-cache-dir --upgrade pip \
+    && "$RTM_VENV/bin/pip" install --no-cache-dir --only-binary=:all: cel-python PyYAML
+# venv 置于 PATH 最前：skills 调用的裸 `python3` 即命中带依赖的解释器。
+ENV PATH="$RTM_VENV/bin:$PATH"
+
+# clone rtm-aihub（完整历史——wiki 工作流运行时要 rebase/push origin main）+ setup.sh。
+# 凭据写进 /root/.git-credentials 供 clone 使用，RUN 结束前 rm——最终 layer 不含 token；
+# 仓库 remote 仍是干净 https URL（凭据在独立文件，非嵌入 URL），运行时另行挂载凭据推送。
+RUN --mount=type=secret,id=code_byted_username \
+    --mount=type=secret,id=code_byted_token \
+    set -eux; \
+    git config --global credential.helper store; \
+    printf 'https://%s:%s@code.byted.org\n' \
+      "$(cat /run/secrets/code_byted_username)" \
+      "$(cat /run/secrets/code_byted_token)" > /root/.git-credentials; \
+    git clone --branch "${RTM_REF}" "${RTM_REPO}" "${RTM_DIR}"; \
+    ( cd "${RTM_DIR}" && bash setup.sh ); \
+    rm -f /root/.git-credentials /root/.gitconfig; \
+    chown -R botmux:botmux "${RTM_DIR}"
+
+# botmux 会话默认工作目录指向 rtm-aihub checkout：会话 cwd 落在此仓，agent CLI
+# 即自动发现 .claude/.codex/.trae 下的 skills（config.ts 读 WORKING_DIR 作会话 cwd）。
+# 注意：只改 botmux 的 WORKING_DIR，不改 Docker WORKDIR——base 的 CMD 是相对路径
+# `node dist/cli.js`，依赖 WORKDIR=/app；换掉会导致 daemon 启动找不到入口。
+ENV WORKING_DIR=${RTM_DIR}
+
+USER botmux
+
+# 校验（全程不触网）：bkectl 由 byted base 继承可用；python 依赖可导入；
+# tooling 全部可编译（语法/缩进无误）；setup.sh 已生成 skills 软链。
+RUN command -v bkectl \
+    && python3 -c "import celpy, yaml; print('rtm-aihub py deps ok')" \
+    && python3 -m py_compile "${RTM_DIR}"/tooling/*.py "${RTM_DIR}"/tooling/util/*.py \
+    && test -L "${RTM_DIR}/.claude/skills" \
+    && test -L "${RTM_DIR}/.codex/skills"
+
+# 其余继承 base 镜像：botmux 用户、Docker WORKDIR=/app、EXPOSE、CMD（仅上面覆盖了 WORKING_DIR）

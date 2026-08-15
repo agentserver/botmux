@@ -87,6 +87,9 @@ jobs:
     needs: build-and-push
     runs-on: k8s-sg
     timeout-minutes: 30
+    # 暴露 byted 镜像的 manifest digest，供下游 runtime 镜像按不可变引用消费
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - uses: actions/checkout@v6
@@ -128,6 +131,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push byted image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -139,6 +143,66 @@ jobs:
           build-args: |
             BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
           # 内网私有仓 + Go module 的 git 凭据，经 BuildKit secret 注入（不落 layer）
+          secrets: |
+            code_byted_username=${{ secrets.CODE_BYTED_USERNAME }}
+            code_byted_token=${{ secrets.CODE_BYTED_TOKEN }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── runtime 变体：以上一个 job 刚推送的 byted 镜像为 base，装入 rtm-aihub（事故 oncall 套件）──
+  # 同样跑在 k8s-sg：需访问内网镜像仓（拉 byted base + 推 runtime 产物，host 由
+  # vars.ICM_REGISTRY 提供）与内网私有仓（clone rtm-aihub，地址见 Dockerfile.runtime）。
+  # base 与产物同在内网仓，故只需登录内网仓一处，无需 ghcr。pip 默认走公网 pypi.org
+  # （Dockerfile.runtime 里 PIP_INDEX_URL 可 --build-arg 覆盖成内网镜像）。
+  build-and-push-runtime:
+    needs: build-and-push-byted
+    runs-on: k8s-sg
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 内网镜像仓：既拉 byted base（上一个 job 推的），又推 runtime 产物，一次登录即可
+      - name: Login to internal image registry (pull byted base + push runtime)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ICM_REGISTRY }}
+          username: ${{ secrets.ICM_USERNAME }}
+          password: ${{ secrets.ICM_PASSWORD }}
+
+      - name: Generate Docker metadata (tags / labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # 与 byted 镜像分开的仓库路径 agentserver/botmux-runtime，host 同为内网 vars.ICM_REGISTRY
+          images: ${{ vars.ICM_REGISTRY }}/agentserver/botmux-runtime
+          # 与上游同一套 tag 规则（master / semver / sha），latest=auto
+          flavor: |
+            latest=auto
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=sha,prefix=sha-
+
+      - name: Build and push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runtime
+          # 单架构 = runner 原生架构：runtime 校验步骤（bkectl / python 导入）原生执行。
+          push: true
+          # 以上一个 job 推送 byted 镜像的 manifest digest 作为 base——不可变、跟本次构建一一对应
+          build-args: |
+            BASE_IMAGE=${{ vars.ICM_REGISTRY }}/agentserver/botmux@${{ needs.build-and-push-byted.outputs.digest }}
+          # clone rtm-aihub 私有仓的 git 凭据，经 BuildKit secret 注入（不落 layer）
           secrets: |
             code_byted_username=${{ secrets.CODE_BYTED_USERNAME }}
             code_byted_token=${{ secrets.CODE_BYTED_TOKEN }}
