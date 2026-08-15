@@ -18,7 +18,15 @@ RUN pnpm install --frozen-lockfile
 
 # Copy source and build
 COPY . .
-RUN pnpm build
+# 跳过 pnpm audit:domains（需要 test/、docs/ 目录，这些在 .dockerignore 中已排除，
+# 且 audit 是 repo 级别检查，在容器构建上下文中无需运行）
+RUN node scripts/clean-dist.mjs && \
+    tsc && \
+    node scripts/generate-runtime-build-id.mjs && \
+    cp src/setup/lark-scopes.json dist/setup/ && \
+    pnpm dashboard:bundle && \
+    chmod +x dist/cli.js && \
+    node scripts/audit-dist.mjs
 
 # Remove devDependencies from node_modules
 RUN pnpm prune --prod
