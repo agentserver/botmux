@@ -58,18 +58,22 @@ RUN python3 -m venv "$RTM_VENV" \
 ENV PATH="$RTM_VENV/bin:$PATH"
 
 # clone rtm-aihub（完整历史——wiki 工作流运行时要 rebase/push origin main）+ setup.sh。
-# 凭据写进 /root/.git-credentials 供 clone 使用，RUN 结束前 rm——最终 layer 不含 token；
-# 仓库 remote 仍是干净 https URL（凭据在独立文件，非嵌入 URL），运行时另行挂载凭据推送。
+# 凭据经 store helper 的显式 --file 落到 /tmp/git-creds，RUN 结束前 rm——最终 layer 不含
+# token；仓库 remote 仍是干净 https URL（凭据在独立文件，非嵌入 URL），运行时另行挂载凭据推送。
+# ⚠️ 必须用显式 --file，不能裸 `store`：本镜像 base 设了 ENV HOME=/home/botmux，而 Docker 的
+#    `USER root` 只换 uid、不重置 $HOME，故 root 下 $HOME 仍是 /home/botmux。裸 store 按 $HOME
+#    找 ~/.git-credentials，会与凭据实际写入路径错位，导致 git 退化成交互式问用户名 →
+#    非 TTY 报 "could not read Username ... No such device or address"。--file 固定路径规避。
 RUN --mount=type=secret,id=code_byted_username \
     --mount=type=secret,id=code_byted_token \
     set -eux; \
-    git config --global credential.helper store; \
+    git config --global credential.helper 'store --file=/tmp/git-creds'; \
     printf 'https://%s:%s@code.byted.org\n' \
       "$(cat /run/secrets/code_byted_username)" \
-      "$(cat /run/secrets/code_byted_token)" > /root/.git-credentials; \
+      "$(cat /run/secrets/code_byted_token)" > /tmp/git-creds; \
     git clone --branch "${RTM_REF}" "${RTM_REPO}" "${RTM_DIR}"; \
     ( cd "${RTM_DIR}" && bash setup.sh ); \
-    rm -f /root/.git-credentials /root/.gitconfig; \
+    rm -f /tmp/git-creds "$HOME/.gitconfig"; \
     chown -R botmux:botmux "${RTM_DIR}"
 
 # botmux 会话默认工作目录指向 rtm-aihub checkout：会话 cwd 落在此仓，agent CLI
