@@ -36,7 +36,7 @@ ARG RTM_REF=main
 # 会话 cwd 落在此仓时，agent CLI 自动发现 .claude/.codex/.trae 下的 skills。
 ARG RTM_DIR=/home/botmux/projects/rtm-aihub
 
-# base 以 botmux 用户结束；装 apt / 建 venv / 克隆到系统目录都需 root。
+# base 以 node 用户结束；装 apt / 建 venv / 克隆到系统目录都需 root。
 USER root
 
 # tooling 是 python3 脚本，base 运行时镜像不含 python3；git 已由 base 提供。
@@ -74,7 +74,7 @@ RUN --mount=type=secret,id=code_byted_username \
     git clone --branch "${RTM_REF}" "${RTM_REPO}" "${RTM_DIR}"; \
     ( cd "${RTM_DIR}" && bash setup.sh ); \
     rm -f /tmp/git-creds "$HOME/.gitconfig"; \
-    chown -R botmux:botmux "${RTM_DIR}"
+    chown -R node:node "${RTM_DIR}"
 
 # botmux 会话默认工作目录指向 rtm-aihub checkout：会话 cwd 落在此仓，agent CLI
 # 即自动发现 .claude/.codex/.trae 下的 skills（config.ts 读 WORKING_DIR 作会话 cwd）。
@@ -82,7 +82,7 @@ RUN --mount=type=secret,id=code_byted_username \
 # `node dist/cli.js`，依赖 WORKDIR=/app；换掉会导致 daemon 启动找不到入口。
 ENV WORKING_DIR=${RTM_DIR}
 
-USER botmux
+USER node
 
 # 校验（全程不触网）：bkectl 由 byted base 继承可用；python 依赖可导入；
 # tooling 全部可编译（语法/缩进无误）；setup.sh 已生成 skills 软链。
@@ -92,4 +92,4 @@ RUN command -v bkectl \
     && test -L "${RTM_DIR}/.claude/skills" \
     && test -L "${RTM_DIR}/.codex/skills"
 
-# 其余继承 base 镜像：botmux 用户、Docker WORKDIR=/app、EXPOSE、CMD（仅上面覆盖了 WORKING_DIR）
+# 其余继承 base 镜像：node 用户、Docker WORKDIR=/app、EXPOSE、CMD（仅上面覆盖了 WORKING_DIR）

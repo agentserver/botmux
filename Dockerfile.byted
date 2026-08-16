@@ -65,7 +65,7 @@ FROM ${BASE_IMAGE}
 # 落到系统 PATH（/usr/local/bin），root 与 botmux 用户都能直接调用。
 COPY --from=bkectl-builder /workspace/repo/output/bkectl /usr/local/bin/bkectl
 
-# base 镜像以 botmux 用户结束；全局 npm 装到 root 拥有的 /usr/local，需切回 root。
+# base 镜像以 node 用户结束；全局 npm 装到 root 拥有的 /usr/local，需切回 root。
 USER root
 
 # 内网 npm 工具（全局装到 root 拥有的 /usr/local，registry 走内网 bnpm）：
@@ -88,8 +88,8 @@ RUN set -eux; \
 # 以运行身份校验工具可用。bkectl 跨架构构建时这一步在目标平台下执行
 # （buildx 经 QEMU 模拟），对每个目标架构都是真实验证；关掉自动更新避免触网。
 # lark-cli 执行已烤入的原生二进制，无需再联网。
-USER botmux
+USER node
 RUN command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
     && command -v lark-cli && lark-cli --version
 
-# 继承 base 镜像的 botmux 用户、env、EXPOSE 与 CMD（无需重复声明）
+# 继承 base 镜像的 node 用户、env、EXPOSE 与 CMD（无需重复声明）

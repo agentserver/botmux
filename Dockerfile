@@ -53,27 +53,28 @@ RUN npm install -g @openai/codex
 # RUN npm install -g @antigravity/cli            # Antigravity
 # RUN pip install kiro-cli                       # Kiro CLI (需要 python3-pip)
 
-# Create non-root user for daemon and CLI child processes
-RUN useradd --create-home --shell /bin/bash botmux
-
+# Run as the non-root `node` user that already ships with the base image
+# (uid/gid 1000). No dedicated account needed — reusing `node` avoids a
+# redundant user and the uid drift a fresh `useradd` would introduce.
 WORKDIR /app
 
 # Copy built artifacts from build stage
-COPY --from=build --chown=botmux:botmux /app/dist ./dist
-COPY --from=build --chown=botmux:botmux /app/node_modules ./node_modules
-COPY --from=build --chown=botmux:botmux /app/package.json ./
-COPY --from=build --chown=botmux:botmux /app/ecosystem.config.cjs ./
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/package.json ./
+COPY --from=build --chown=node:node /app/ecosystem.config.cjs ./
 
 # Setup data directory (logs, session state)
-RUN mkdir -p /app/data/logs && chown -R botmux:botmux /app/data
+RUN mkdir -p /app/data/logs && chown -R node:node /app/data
 
-# Setup config directory (bots.json, config.json, .env, fonts)
-RUN mkdir -p /home/botmux/.botmux && chown -R botmux:botmux /home/botmux/.botmux
+# App home: config dir (bots.json, config.json, .env, fonts) + default CLI
+# working dir. /home/botmux isn't the `node` user's passwd home (/home/node),
+# so chown the whole tree to make $HOME (set below) fully writable by `node`
+# — git config, tool caches and session state all land here at runtime.
+RUN mkdir -p /home/botmux/.botmux /home/botmux/projects \
+    && chown -R node:node /home/botmux
 
-# Default working directory for CLI sessions
-RUN mkdir -p /home/botmux/projects && chown -R botmux:botmux /home/botmux/projects
-
-USER botmux
+USER node
 
 ENV NODE_ENV=production
 ENV SESSION_DATA_DIR=/app/data
