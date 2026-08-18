@@ -78,8 +78,8 @@ RUN --mount=type=secret,id=code_byted_username \
 
 # botmux 会话默认工作目录指向 rtm-aihub checkout：会话 cwd 落在此仓，agent CLI
 # 即自动发现 .claude/.codex/.trae 下的 skills（config.ts 读 WORKING_DIR 作会话 cwd）。
-# 注意：只改 botmux 的 WORKING_DIR，不改 Docker WORKDIR——base 的 CMD 是相对路径
-# `node dist/cli.js`，依赖 WORKDIR=/app；换掉会导致 daemon 启动找不到入口。
+# 注意：这里只覆盖 botmux 会话的 WORKING_DIR（会话 cwd），不动其它继承自 base 的
+# env/WORKDIR。base 的 CMD 是全局 bin `botmux start`（PATH 解析，与 WORKDIR 无关）。
 ENV WORKING_DIR=${RTM_DIR}
 
 USER node
