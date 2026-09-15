@@ -1,11 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# botmux 基础镜像：直接从 npm 全局安装已发布的 botmux（不再从源码编译）。
-# 版本由 BOTMUX_VERSION 控制（默认 latest）；CI 可 --build-arg 固定到某次发版的
-# 版本号，让 :master / :sha-xxx 这些镜像 tag 的内容可复现。
-#
-# ⚠️ 语义变化：镜像内是「npm 上发布的 botmux」，与当前构建的源码 commit 解耦——
-#    发版只在打 v* tag 时发生，故 :master 镜像可能滞后于 master 上尚未发版的改动。
+# botmux 基础镜像：安装 GitHub Release 的自包含二进制。
 FROM node:22-bookworm-slim
 
 # Runtime system dependencies:
@@ -16,23 +11,20 @@ FROM node:22-bookworm-slim
 # - fonts-noto-cjk: CJK character coverage in terminal screenshots
 # - fonts-noto-color-emoji: emoji rendering in screenshots
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux git ca-certificates \
+    tmux git curl ca-certificates \
     libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
     libgif7 libjpeg62-turbo librsvg2-2 \
     fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
-# npm 包通过平台子包分发自包含二进制，已不含 dist/ 或 npm bin 入口。
-# postinstall 写出的 launcher 在 /root/.botmux 下，运行用户无法访问，且运行时
-# /home/botmux/.botmux 会被 PVC 覆盖。将平台二进制直接链接到系统 PATH。
 ARG BOTMUX_VERSION=latest
 RUN set -eux; \
-    npm install -g "botmux@${BOTMUX_VERSION}"; \
-    ln -s "$(node -p 'require.resolve("botmux-" + process.platform + "-" + process.arch + "/package.json", { paths: ["/usr/local/lib/node_modules/botmux"] }).replace(/package.json$/, "botmux")')" /usr/local/bin/botmux; \
+    version="${BOTMUX_VERSION}"; \
+    case "$version" in latest) ;; v*) ;; *) version="v${version}" ;; esac; \
+    BOTMUX_VERSION="$version" BOTMUX_INSTALL_DIR=/usr/local/bin \
+      sh -c 'curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh'; \
     botmux --version; \
-    test "$(botmux --version)" = "$(node -p 'require("/usr/local/lib/node_modules/botmux/package.json").version')"; \
-    npm cache clean --force; \
-    rm -rf /root/.npm /root/.botmux
+    if [ "$version" != latest ]; then test "$(botmux --version)" = "${version#v}"; fi
 
 # ── AI CLI tools ──────────────────────────────────────────────────────────────
 # botmux 是桥接层，本身不包含 AI 能力。至少需要安装一个 CLI 才能工作。
@@ -69,13 +61,11 @@ ENV SESSION_DATA_DIR=/app/data
 ENV HOME=/home/botmux
 ENV WORKING_DIR=/home/botmux/projects
 
-# 用最终的非 root 身份校验 PATH、二进制权限和打包版本。
-RUN botmux --version \
-    && test "$(botmux --version)" = "$(node -p 'require("/usr/local/lib/node_modules/botmux/package.json").version')"
+# 用最终的非 root 身份校验二进制。
+RUN command -v botmux && botmux --version
 
 # Dashboard & web terminal proxy ports
 EXPOSE 7891 8800
 
-# botmux 已全局安装，bin 在 PATH（/usr/local/bin/botmux）——用绝对命令启动，
-# 不再依赖 WORKDIR 下的相对入口（旧版是 `node dist/cli.js`，依赖 WORKDIR=/app）。
+# botmux 二进制位于 /usr/local/bin。
 CMD ["botmux", "start"]
