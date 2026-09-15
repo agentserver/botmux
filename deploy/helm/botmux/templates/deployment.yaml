@@ -31,7 +31,7 @@ spec:
           args:
             - |
               set -eu
-              marker=/home/node/.botmux/.lark-cli-initialized
+              marker=/home/node/.lark-cli-initialized
               if [ -f "$marker" ]; then exit 0; fi
               if [ -n "${LARK_CLI_APP_ID}" ] && [ -n "${LARK_CLI_APP_SECRET}" ]; then
                 printf '%s' "${LARK_CLI_APP_SECRET}" | lark-cli config init --app-id "${LARK_CLI_APP_ID}" --app-secret-stdin --brand "${LARK_CLI_BRAND}"
