@@ -9,6 +9,13 @@ service:
   type: ClusterIP
   dashboardPort: 7891
   terminalPort: 8800
+
+ingress:
+  enabled: false
+  host: ""
+  gatewayName: istio-gateway
+  gatewayNamespace: istio-ingress
+  gatewaySectionName: https-byted-bps
 persistence:
   enabled: true
   storageClass: longhorn
@@ -32,4 +39,3 @@ serviceAccount:
   name: ""
   automount: true
 resources: {}
-
