@@ -47,3 +47,24 @@ serviceAccount:
   name: ""
   automount: true
 resources: {}
+
+codex:
+  model: gpt-6-astra
+  modelProvider: llm
+  modelReasoningEffort: xhigh
+  modelContextWindow: 1050000
+  modelAutoCompactTokenLimit: 900000
+  sandboxMode: danger-full-access
+  approvalPolicy: never
+  checkForUpdateOnStartup: false
+  provider:
+    id: llm
+    name: LLM
+    baseUrl: ""
+    envKey: OPENAI_API_KEY
+    wireApi: responses
+  tui:
+    statusLine:
+      - model
+      - context-remaining
+      - git-branch
