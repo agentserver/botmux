@@ -16,6 +16,7 @@ spec:
       labels:
         {{- include "botmux.labels" . | nindent 8 }}
     spec:
+      shareProcessNamespace: true
       serviceAccountName: {{ include "botmux.serviceAccountName" . }}
       securityContext:
         runAsUser: 1000
