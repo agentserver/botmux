@@ -91,8 +91,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ── byted 内网工具变体：继承本次 botmux base，追加 bkectl + bytedcli + lark-cli ──
-  # 跑在 k8s-sg 自建 runner 上——它能同时访问内网源（编译 bkectl / 装 bytedcli 所需的
-  # 内网 git 与 npm registry，具体地址见 Dockerfile.byted）、ghcr.io（拉 base 镜像）
+  # 跑在 k8s-sg 自建 runner 上——它能访问 bkectl 安装脚本、BVC 发布包、内网 npm，
+  # 以及 ghcr.io（拉 base 镜像）
   # 与内网镜像仓（推产物，registry 地址由 vars.ICM_REGISTRY 提供，避免把内网 host
   # 写进受 audit:domains 扫描的 .github/）。GitHub 托管 runner 连不上内网，故不可用。
   build-and-push-byted:
@@ -148,16 +148,12 @@ jobs:
         with:
           context: .
           file: Dockerfile.byted
-          # 单架构 = runner 原生架构：final 阶段的 `bkectl version` 原生执行，
-          # 无需 QEMU。如需多架构，另加 setup-qemu-action 并设 platforms。
+          # BVC 当前发布包仅支持 amd64，与 k8s-sg runner 一致。
+          platforms: linux/amd64
           push: true
           # 以上一个 job 推送镜像的 manifest digest 作为 base——不可变、跟本次构建一一对应
           build-args: |
             BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
-          # 内网私有仓 + Go module 的 git 凭据，经 BuildKit secret 注入（不落 layer）
-          secrets: |
-            code_byted_username=${{ secrets.CODE_BYTED_USERNAME }}
-            code_byted_token=${{ secrets.CODE_BYTED_TOKEN }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
