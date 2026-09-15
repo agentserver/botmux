@@ -10,7 +10,7 @@ ARG LARK_CLI_VERSION=latest
 # BVC 当前发布包仅支持 linux/amd64。
 RUN test "$TARGETARCH" = amd64 \
     && apt-get update \
-    && apt-get install -y --no-install-recommends bash curl \
+    && apt-get install -y --no-install-recommends bash \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \
@@ -20,8 +20,7 @@ RUN set -eu; \
     mkdir -p /opt/bvc; \
     tar -xzf /tmp/bvc.tar.gz -C /opt/bvc; \
     rm /tmp/bvc.tar.gz; \
-    ln -s /opt/bvc/bin/bvc /usr/local/bin/bvc; \
-    ln -s /home/botmux/.local/bin/bkectl /usr/local/bin/bkectl
+    install -m 0755 /opt/bvc/bin/bvc /usr/local/bin/bvc
 
 RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
       "@bytedance-dev/bytedcli@${BYTEDCLI_VERSION}" \
@@ -38,6 +37,10 @@ RUN bash -c 'set -euo pipefail; \
     script="$(curl -fsSL --connect-timeout 2 --max-time 6 "https://gd2o4mok.china-north-dt-fn.bytedance.net/scripts/bkectl_install.sh")"; \
     bash <<<"$script"'
 
+USER root
+RUN install -m 0755 /home/botmux/.local/bin/bkectl /usr/local/bin/bkectl
+
+USER node
 RUN --network=none command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
     && command -v bytedcli && bytedcli --version \
     && command -v lark-cli && lark-cli --version
