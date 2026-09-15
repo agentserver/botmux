@@ -90,7 +90,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── byted 内网工具变体：以上一个 job 刚推送的 botmux 镜像为 base，追加 bkectl + bytedcli ──
+  # ── byted 内网工具变体：继承本次 botmux base，追加 bkectl + bytedcli + lark-cli ──
   # 跑在 k8s-sg 自建 runner 上——它能同时访问内网源（编译 bkectl / 装 bytedcli 所需的
   # 内网 git 与 npm registry，具体地址见 Dockerfile.byted）、ghcr.io（拉 base 镜像）
   # 与内网镜像仓（推产物，registry 地址由 vars.ICM_REGISTRY 提供，避免把内网 host
