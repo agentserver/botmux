@@ -34,9 +34,7 @@ RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
       "@larksuite/cli@${LARK_CLI_VERSION}" \
     && lark-cli --version \
     && bytedcli --version \
-    && npm cache clean --force \
-    && mkdir -p /home/botmux/.local/bin \
-    && chown -R node:node /home/botmux/.local
+    && npm cache clean --force
 
 USER node
 RUN --network=none command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
