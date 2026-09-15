@@ -27,22 +27,9 @@ credentials:
     serviceAccount:
       accessKeyId: ""
       secretAccessKey: ""
-  codex:
-    apiKey: ""
 serviceAccount:
   create: true
   name: ""
   automount: true
 resources: {}
 
-codex:
-  model: gpt-5.6
-  approvalPolicy: on-request
-  sandboxMode: workspace-write
-  provider:
-    id: modelserver
-    name: modelserver
-    baseUrl: ""
-    envKey: OPENAI_API_KEY
-    wireApi: responses
-    requiresOpenaiAuth: false
