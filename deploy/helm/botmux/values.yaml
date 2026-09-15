@@ -6,7 +6,7 @@ image:
 imagePullSecrets: []
 botIndex: "0"
 setup:
-  enabled: false
+  # Required: setup add cannot safely create a bot without an owner.
   allowedUsers: []
   cli: codex
   workingDir: /home/node
