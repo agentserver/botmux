@@ -40,6 +40,8 @@ credentials:
     serviceAccount:
       accessKeyId: ""
       secretAccessKey: ""
+  codex:
+    apiKey: ""
 serviceAccount:
   create: true
   name: ""
