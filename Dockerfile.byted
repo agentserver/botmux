@@ -10,7 +10,7 @@ ARG LARK_CLI_VERSION=latest
 # BVC 当前发布包仅支持 linux/amd64。
 RUN test "$TARGETARCH" = amd64 \
     && apt-get update \
-    && apt-get install -y --no-install-recommends bash curl nodejs npm \
+    && apt-get install -y --no-install-recommends bash curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # botmux 基础镜像：安装 GitHub Release 的自包含二进制。
-FROM debian:trixie-slim
+FROM node:trixie-slim
 
 # Runtime system dependencies:
 # - tmux: default session backend (required)
@@ -13,9 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgif7 libjpeg62-turbo librsvg2-2 \
     fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd --gid 1000 node \
-    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/sh node
 
 ARG BOTMUX_VERSION=latest
 RUN set -eux; \
