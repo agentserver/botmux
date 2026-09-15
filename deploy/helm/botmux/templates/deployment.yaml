@@ -24,6 +24,34 @@ spec:
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       initContainers:
+        {{- if .Values.setup.enabled }}
+        - name: configure-botmux
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              marker=/home/node/.botmux/.botmux-setup-initialized
+              if [ -f "$marker" ]; then exit 0; fi
+              botmux setup add --app-id "$LARK_CLI_APP_ID" --app-secret "$LARK_CLI_APP_SECRET" \
+                --allowed-users "$BOTMUX_ALLOWED_USERS" --cli "$BOTMUX_SETUP_CLI" \
+                --working-dir "$BOTMUX_SETUP_WORKING_DIR" {{ if .Values.setup.openPlatformAuto }}--open-platform-auto{{ else }}--no-open-platform-auto{{ end }} --json
+              touch "$marker"
+          env:
+            - name: BOTMUX_ALLOWED_USERS
+              value: {{ join "," .Values.setup.allowedUsers | quote }}
+            - name: BOTMUX_SETUP_CLI
+              value: {{ .Values.setup.cli | quote }}
+            - name: BOTMUX_SETUP_WORKING_DIR
+              value: {{ .Values.setup.workingDir | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ include "botmux.credentialsSecretName" . }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+        {{- end }}
         - name: configure-lark-cli
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}

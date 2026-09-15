@@ -5,6 +5,12 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 botIndex: "0"
+setup:
+  enabled: false
+  allowedUsers: []
+  cli: codex
+  workingDir: /home/node
+  openPlatformAuto: false
 service:
   type: ClusterIP
   dashboardPort: 7891
