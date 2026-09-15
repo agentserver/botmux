@@ -28,21 +28,18 @@ RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/usr/local/share/codex CODEX_NON
     chown -R node:node /usr/local/share/codex /usr/local/bin/codex /usr/local/bin/codex-code-mode-host; \
     codex --version
 
-WORKDIR /app
-
-# Setup data directory (logs, session state). SESSION_DATA_DIR 指向这里（绝对路径）。
-RUN mkdir -p /app/data/logs && chown -R node:node /app/data
+WORKDIR /home/node
 
 # App home and default CLI working directory.
-RUN mkdir -p /home/botmux/.botmux /home/botmux/projects \
-    && chown -R node:node /home/botmux
+RUN mkdir -p /home/node/.botmux \
+    && chown -R node:node /home/node
 
 USER node
 
 ENV NODE_ENV=production
-ENV SESSION_DATA_DIR=/app/data
-ENV HOME=/home/botmux
-ENV WORKING_DIR=/home/botmux/projects
+ENV SESSION_DATA_DIR=/home/node/.botmux/data
+ENV HOME=/home/node
+ENV WORKING_DIR=/home/node
 
 # 用最终的非 root 身份校验二进制。
 RUN command -v botmux && botmux --version && command -v codex && codex --version
