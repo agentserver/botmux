@@ -1,0 +1,34 @@
+replicaCount: 1
+image:
+  repository: aliyun-sin-hub.byted.org/agentserver/botmux
+  tag: 3.22.0-byted.5
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+botIndex: "0"
+service:
+  type: ClusterIP
+  dashboardPort: 7891
+  terminalPort: 8800
+persistence:
+  enabled: true
+  storageClass: longhorn
+  size: 30Gi
+credentials:
+  existingSecret: ""
+  larkCli:
+    appId: ""
+    appSecret: ""
+    brand: feishu
+  bytedcli:
+    serviceAccount:
+      accessKeyId: ""
+      secretAccessKey: ""
+  bkectl:
+    serviceAccount:
+      accessKeyId: ""
+      secretAccessKey: ""
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+resources: {}
