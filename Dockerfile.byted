@@ -7,7 +7,7 @@ ARG TARGETARCH
 ARG BYTEDCLI_VERSION=latest
 ARG LARK_CLI_VERSION=latest
 
-# BVC 当前发布包仅支持 linux/amd64。
+# BVC 当前发布包仅支持 linux/amd64；bkectl 从 sre/tce/srectl 获取。
 RUN test "$TARGETARCH" = amd64 \
     && apt-get update \
     && apt-get install -y --no-install-recommends bash \
@@ -22,6 +22,13 @@ RUN set -eu; \
     rm /tmp/bvc.tar.gz; \
     install -m 0755 /opt/bvc/bin/bvc /usr/local/bin/bvc
 
+RUN set -eu; \
+    mkdir -p /opt/bkectl; \
+    cd /opt/bkectl; \
+    bvc clone sre/tce/srectl; \
+    install -m 0755 /opt/bkectl/srectl/bkectl /usr/local/bin/bkectl; \
+    rm -rf /opt/bkectl
+
 RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
       "@bytedance-dev/bytedcli@${BYTEDCLI_VERSION}" \
       "@larksuite/cli@${LARK_CLI_VERSION}" \
@@ -30,15 +37,6 @@ RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
     && npm cache clean --force \
     && mkdir -p /home/botmux/.local/bin \
     && chown -R node:node /home/botmux/.local
-
-# 以运行用户安装，保留 ~/.local 下的产物和更新权限。
-USER node
-RUN bash -c 'set -euo pipefail; \
-    script="$(curl -fsSL --connect-timeout 2 --max-time 6 "https://gd2o4mok.china-north-dt-fn.bytedance.net/scripts/bkectl_install.sh")"; \
-    bash <<<"$script"'
-
-USER root
-RUN install -m 0755 /home/botmux/.local/bin/bkectl /usr/local/bin/bkectl
 
 USER node
 RUN --network=none command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
