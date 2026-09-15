@@ -22,19 +22,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
-# 从 npm 全局安装 botmux（bin: botmux → dist/cli.js，落到 /usr/local/bin）。
-# node-pty 是原生模块、无预编译产物（见 package.json 的 onlyBuiltDependencies），
-# npm 安装时需 C/C++ 工具链现场编译；故临时装 python3/make/gcc/g++，装完在同一层
-# purge——编译出的 .node 留在全局 node_modules 里，工具链不进最终 layer，镜像保持精简。
+# npm 包通过平台子包分发自包含二进制，已不含 dist/ 或 npm bin 入口。
+# postinstall 写出的 launcher 在 /root/.botmux 下，运行用户无法访问，且运行时
+# /home/botmux/.botmux 会被 PVC 覆盖。将平台二进制直接链接到系统 PATH。
 ARG BOTMUX_VERSION=latest
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends python3 make gcc g++; \
     npm install -g "botmux@${BOTMUX_VERSION}"; \
+    ln -s "$(node -p 'require.resolve("botmux-" + process.platform + "-" + process.arch + "/package.json", { paths: ["/usr/local/lib/node_modules/botmux"] }).replace(/package.json$/, "botmux")')" /usr/local/bin/botmux; \
+    botmux --version; \
+    test "$(botmux --version)" = "$(node -p 'require("/usr/local/lib/node_modules/botmux/package.json").version')"; \
     npm cache clean --force; \
-    apt-get purge -y python3 make gcc g++; \
-    apt-get autoremove -y --purge; \
-    rm -rf /var/lib/apt/lists/* /root/.npm
+    rm -rf /root/.npm /root/.botmux
 
 # ── AI CLI tools ──────────────────────────────────────────────────────────────
 # botmux 是桥接层，本身不包含 AI 能力。至少需要安装一个 CLI 才能工作。
@@ -70,6 +68,10 @@ ENV NODE_ENV=production
 ENV SESSION_DATA_DIR=/app/data
 ENV HOME=/home/botmux
 ENV WORKING_DIR=/home/botmux/projects
+
+# 用最终的非 root 身份校验 PATH、二进制权限和打包版本。
+RUN botmux --version \
+    && test "$(botmux --version)" = "$(node -p 'require("/usr/local/lib/node_modules/botmux/package.json").version')"
 
 # Dashboard & web terminal proxy ports
 EXPOSE 7891 8800

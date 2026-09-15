@@ -8,10 +8,20 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      botmux_version:
+        description: 要安装的 npm botmux 版本（与镜像 tag 分开指定）
+        required: true
+        default: latest
+        type: string
       tag:
         description: 自定义镜像 tag（留空则用 commit SHA）
         required: false
         type: string
+      build_runtime:
+        description: 同时构建 rtm-aihub 运行时变体
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -73,6 +83,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            BOTMUX_VERSION=${{ inputs.botmux_version || 'latest' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -158,6 +170,7 @@ jobs:
   # （Dockerfile.runtime 里 PIP_INDEX_URL 可 --build-arg 覆盖成内网镜像）。
   build-and-push-runtime:
     needs: build-and-push-byted
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_runtime }}
     runs-on: k8s-sg
     timeout-minutes: 30
 
