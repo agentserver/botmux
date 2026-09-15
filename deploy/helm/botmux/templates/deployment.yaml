@@ -25,6 +25,22 @@ spec:
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       initContainers:
+        - name: fix-home-perms
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - >-
+              mkdir -p /home/node/.botmux;
+              chown 1000:1000 /home/node/.botmux;
+              chmod 700 /home/node/.botmux;
+              find /home/node/.botmux -maxdepth 1 -type f -exec chown 1000:1000 {} + -exec chmod 600 {} +
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
         - name: configure-botmux
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
