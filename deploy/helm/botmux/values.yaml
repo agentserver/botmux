@@ -5,6 +5,12 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 botIndex: "0"
+setup:
+  # Required: setup add cannot safely create a bot without an owner.
+  allowedUsers: []
+  cli: codex
+  workingDir: /home/node
+  openPlatformAuto: false
 service:
   type: ClusterIP
   dashboardPort: 7891
