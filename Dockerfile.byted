@@ -28,7 +28,9 @@ RUN NPM_CONFIG_REGISTRY=http://bnpm.byted.org npm install -g \
       "@larksuite/cli@${LARK_CLI_VERSION}" \
     && lark-cli --version \
     && bytedcli --version \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && mkdir -p /home/botmux/.local/bin \
+    && chown -R node:node /home/botmux/.local
 
 # 以运行用户安装，保留 ~/.local 下的产物和更新权限。
 USER node
