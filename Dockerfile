@@ -23,8 +23,9 @@ RUN set -eux; \
     botmux --version; \
     if [ "$version" != latest ]; then test "$(botmux --version)" = "${version#v}"; fi
 
-RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_NON_INTERACTIVE=1 \
+RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/usr/local/share/codex CODEX_NON_INTERACTIVE=1 \
     sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'; \
+    chown -R node:node /usr/local/share/codex /usr/local/bin/codex /usr/local/bin/codex-code-mode-host; \
     codex --version
 
 WORKDIR /app
