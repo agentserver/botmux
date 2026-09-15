@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
   CARD_POSTING_SENTINEL: '__posting__',
   };
@@ -333,6 +333,51 @@ describe('repo select card — plain switch', () => {
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('/close');
   });
 
+  it('does not create a replacement session when the old close left a residual', async () => {
+    // Picking a directory is not consent to leave a remote session running. The old
+    // row DID close (quarantined lineage cannot be cancelled safely), so this is not
+    // a failure — but the switch must stop and say so rather than silently spawning
+    // a replacement on top of an uncancelled remote session.
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('mojo-parked-9');
+    expect(said).toContain('未创建新会话');
+  });
+
+  it('a LOCAL-subtree residual on card repo switch points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('本机');
+    expect(said).toContain('未创建新会话');
+    expect(said).not.toContain('undefined');
+    expect(said).not.toMatch(/远端会话.*未.*取消/);
+  });
+
   it('rejects a callback from any card id other than the currently published picker', async () => {
     const ds = makeDs({
       pendingRepo: true,
@@ -428,6 +473,35 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
+  it('uses the selected CLI snapshot when pendingRepo is submitted from the card', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      worker: null,
+      session: {
+        ...makeDs().session,
+        cliLaunchSnapshot: {
+          version: 1,
+          state: 'pending',
+          entryId: 'codex',
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: null,
+          reasoningEffort: null,
+          launchShell: null,
+          startupCommands: [],
+        },
+      },
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
+  });
+
   // ─── empty start (no buffered user input at all) ─────────────────────────
   //
   // Reached when the session was created by a bare `/repo` (the message IS the
@@ -436,7 +510,7 @@ describe('repo select card — plain switch', () => {
   // next real message gets the full new-topic opening context.
 
   it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', pendingTurnId: 'om_bare_worktree', worker: null });
     const { deps } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
@@ -1023,12 +1097,27 @@ describe('repo select card — plain switch', () => {
     const originalRoot = 'om_original_chat_start';
     const ds = makeDs({
       scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_old_reply_topic',
+        turnId: 'turn-old',
+        updatedAt: new Date().toISOString(),
+      },
+      replyThreadAliases: {
+        om_old_reply_topic: {
+          createdAt: new Date().toISOString(),
+          lastUsedAt: new Date().toISOString(),
+        },
+      },
+      streamCardReplyTargetKey: 'thread:om_old_reply_topic',
       session: {
         ...makeDs().session,
         scope: 'chat',
         rootMessageId: originalRoot,
       },
     });
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.replyThreadAliases = ds.replyThreadAliases;
+    ds.session.streamCardReplyTargetKey = 'thread:om_old_reply_topic';
     ds.session.workingDir = '/repos/gamma';
     const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -1047,9 +1136,15 @@ describe('repo select card — plain switch', () => {
 
     await handleCardAction(event, deps, APP_ID);
 
-    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
+    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat', { source: 'ordinary-feishu' });
     expect(ds.session.scope).toBe('chat');
     expect(ds.session.rootMessageId).toBe(originalRoot);
+    expect(ds.currentReplyTarget).toBeUndefined();
+    expect(ds.replyThreadAliases).toBeUndefined();
+    expect(ds.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases).toBeUndefined();
+    expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
     const persisted = vi.mocked(updateSession).mock.calls.find(
       ([s]) => s.sessionId.startsWith('uuid-new-'),
     )?.[0];
@@ -1084,7 +1179,7 @@ describe('repo select card — plain switch', () => {
     await Promise.resolve();
     expect(contenderEntered).toBe(false);
 
-    close.resolve({ ok: true, alreadyClosed: false });
+    close.resolve({ ok: true, outcome: 'closed', alreadyClosed: false });
     await switching;
     const ownerAfterSwitch = await contender;
     expect(contenderEntered).toBe(true);
@@ -1788,6 +1883,49 @@ describe('repo select card — worktree open', () => {
     expect(vi.mocked(deleteMessage)).not.toHaveBeenCalled();
   });
 
+  it('close_worktree_confirm rejects a non-operator before running the destructive command', async () => {
+    const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+    const { deps } = makeDeps(ds);
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+
+    const res = await handleCardAction({
+      operator: { open_id: 'ou_stranger' },
+      action: { value: {
+        action: 'close_worktree_confirm',
+        root_id: ROOT_ID,
+        session_id: ds.session.sessionId,
+        invoker_open_id: OWNER,
+      } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('操作员');
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
+  it('close_worktree_confirm is pinned to the operator who requested the confirmation', async () => {
+    const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: {
+        action: 'close_worktree_confirm',
+        root_id: ROOT_ID,
+        session_id: ds.session.sessionId,
+        invoker_open_id: 'ou_other_operator',
+      } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('发起本次确认');
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
   it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {
     // 与上面的 worktree_toggle_mode 对照：敏感门控默认静默 block（仅日志），但
     //「获取操作链接」是用户主动点的取权动作，静默会让人以为按钮坏了 —— 破例给提示。
@@ -1830,6 +1968,52 @@ describe('repo select card — worktree open', () => {
 });
 
 describe('auto-worktree detached commit admission', () => {
+  it('fails closed when the preserved target subdirectory is absent', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockResolvedValueOnce({ dir: '/repos/alpha-wt' });
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha/packages/app',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+      targetSubdir: 'packages/app',
+    });
+
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('packages/app'));
+  });
+
+  it('keeps an explicit failed worktree start actionable while pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'delayed first turn', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(new Error('cannot create worktree'));
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      prompt: 'delayed first turn',
+      activeSessions: deps.activeSessions,
+      notify,
+      force: true,
+    });
+
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.worker).toBeNull();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/repo'));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/tw'));
+  });
+
   it('holds the delayed commit/fork behind a same-bot mutation after the caller lease ended', async () => {
     const ds = makeDs({
       pendingRepo: true,

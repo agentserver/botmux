@@ -61,11 +61,17 @@ describe('worker durable lease expiry ordering', () => {
     const rawArm = restart.indexOf('rawInputRestartGate = true;', arm);
     const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', rawArm);
     const destroy = restart.indexOf('destroySession?.()', arm);
-    const kill = restart.indexOf('killCli({ preservePending: opts.preservePending });', destroy);
+    const kill = restart.indexOf(
+      'killCli({\n        preservePending: opts.preservePending,\n        preservePolicyCapability: true,',
+      destroy,
+    );
     const spawn = restart.indexOf('await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });', destroy);
     const release = restart.indexOf('cliRestartInProgress = false;', spawn);
     const riffRawRelease = restart.indexOf(
-      "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",
+      // Widened from a riff-only check to every remote backend (riff / mojo):
+      // both mark themselves prompt-ready inside spawnCli(), so both need the
+      // raw-input fence released here rather than at a later markPromptReady().
+      "if (isRemoteBackendType(effectiveBackendType) && isPromptReady) releaseRawInputRestartGate();",
       release,
     );
     const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);
@@ -156,8 +162,8 @@ describe('worker durable lease expiry ordering', () => {
     const terminalStart = workerSource.indexOf('function emitTurnTerminal(');
     const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
     const terminal = workerSource.slice(terminalStart, terminalEnd);
-    expect(terminal).toContain('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);');
-    expect(terminal.indexOf('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);'))
+    expect(terminal).toContain("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });");
+    expect(terminal.indexOf("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });"))
       .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
 
     const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');

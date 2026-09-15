@@ -50,6 +50,7 @@ export type {
 export interface GoalInputs {
   inputs: Array<{
     from: string;          // upstream nodeId
+    output?: string;       // schemaVersion 2 stable public-output key
     name: string;          // logical file name (from upstream manifest)
     path: string;          // ABSOLUTE path, ready to Read
     kind: ManifestFileKind;
@@ -153,6 +154,8 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
@@ -179,7 +182,10 @@ export interface BotSnapshot {
 export interface WorkerSessionInfo {
   sessionId: string;
   webPort?: number;
+  /** Private write capability. May return to the runtime result, never journal it. */
   token?: string;
+  /** Per-worker-boot read capability used by card terminal links. */
+  viewToken?: string;
 }
 
 export interface RunNodeRequest {

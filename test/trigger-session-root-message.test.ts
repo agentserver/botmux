@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     map.set(key, ds);
     return true;
   },
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })),
   getDaemonBootId: () => 'test-boot-id',
 }));
 
@@ -217,7 +217,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
     expect(mockGetMessageChatId).toHaveBeenCalledWith(APP, ROOT);
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
@@ -226,6 +226,39 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
+  });
+
+  it('stamps per-turn model + reasoningEffort onto a grok session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'grok', workingDir: '/tmp' },
+      botName: 'Grok', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'grok-4.6', reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // 与 codex 那条同理：per-trigger 的 model 只落内存态运行时会话，不落盘。
+    expect(ds?.spawnModelOverride).toBe('grok-4.6');
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('stamps per-turn reasoningEffort onto a claude-code session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
+      botName: 'Claude', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-5', reasoningEffort: 'max' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBe('claude-opus-5');
+    expect(ds?.session.model).toBeUndefined();
+    // max is claude-only (codex tops out the same list but grok/traex do not);
+    // it must survive the trigger gate verbatim.
+    expect(ds?.session.reasoningEffort).toBe('max');
   });
 
   it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
@@ -238,9 +271,44 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // The model override is PER TRIGGER, so it lands on the in-memory runtime
+    // session only. Persisting it (the old behavior) made a one-shot caller
+    // choice outrank the bot's configured model on every later resume, forever.
+    expect(ds?.spawnModelOverride).toBe('gpt-5.6-terra');
+    expect(ds?.session.model).toBeUndefined();
     // xhigh preserved verbatim (no downgrade — codex 0.145 accepts it)
-    expect(ds?.session.model).toBe('gpt-5.6-terra');
     expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('stamps per-turn model + reasoningEffort onto a TraeX session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp' },
+      botName: 'TraeX', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'DeepSeek-V4-Pro', reasoningEffort: 'medium' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBe('DeepSeek-V4-Pro');
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBe('medium');
+  });
+
+  it('rejects an unsupported TraeX reasoning effort pair', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp', model: 'DeepSeek-V4-Pro' },
+      botName: 'TraeX', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
   });
 
   it('rejects a model-only override that forms an unsupported effective pair', async () => {
@@ -283,14 +351,19 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(activeSessions.size).toBe(0);
   });
 
-  it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
-    // Harness default bot is claude-code. The gate must keep the override from
-    // silently changing a non-codex bot's model.
+  it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
+    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // gate must keep the override from silently changing such a bot's model.
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
+      botName: 'Gemini', botOpenId: 'ou_bot',
+    });
     const req = request();
-    (req.options as any) = { model: 'claude-opus-4-8', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBeUndefined();
     expect(ds?.session.model).toBeUndefined();
     expect(ds?.session.reasoningEffort).toBeUndefined();
   });
@@ -303,7 +376,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'CI 构建失败，请检查发布流水线');
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
   });
 
@@ -315,7 +388,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);
@@ -445,6 +518,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(mockCreateSession).not.toHaveBeenCalled(); // folded in, not new
     expect(ds.session.model).toBe('frozen-model');
+    expect(ds.spawnModelOverride).toBeUndefined();   // no per-trigger override either
     expect(ds.session.reasoningEffort).toBe('low');
   });
 

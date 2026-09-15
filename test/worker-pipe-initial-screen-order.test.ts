@@ -37,7 +37,7 @@ describe('worker pipe initial screen ordering', () => {
       source.indexOf("case 'close':"),
       source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
     // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
     // send() is dropped when process.exit(0) wedges in node-pty's native exit
@@ -448,8 +448,10 @@ describe('worker pipe initial screen ordering', () => {
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
     // Two additional checks normalize nested spawn failures before the three
-    // restart/init/message handlers consume them.
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    // restart/init/message handlers consume them; plus the generational-race
+    // provenance commit re-throws a superseded spawn instead of tearing down
+    // (the commit-fail path must not swallow CliSpawnSupersededError).
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(6);
     const restartHandler = source.slice(
       source.indexOf('async function restartCliProcess('),
       source.indexOf('// ─── HTTP + WebSocket Server'),
@@ -628,15 +630,20 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('limits busy-pattern idle probes to the active status region', () => {
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const helperStart = source.indexOf('function busyProbeRegion(content: string): string');
-    const probeStart = source.indexOf('function probeBusyPatternIdle');
-    const probeEnd = source.indexOf('function scheduleReattachIdleProbe');
-    const helper = source.slice(helperStart, probeEnd);
-    const probe = source.slice(probeStart, probeEnd);
+    // The region helper lives in src/utils/busy-probe.ts (it must strip ANSI
+    // before slicing — tmux capture-pane -e emits SGR codes at line starts
+    // that break the claude busyPattern's ^ anchor); the probe that calls it
+    // stays in worker.ts.
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperSource = readFileSync(join(process.cwd(), 'src/utils/busy-probe.ts'), 'utf8');
+    const probeStart = workerSource.indexOf('function probeBusyPatternIdle');
+    const probeEnd = workerSource.indexOf('function scheduleReattachIdleProbe');
+    const probe = workerSource.slice(probeStart, probeEnd);
 
-    expect(helperStart).toBeGreaterThan(-1);
-    expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(helperSource).toContain('export function busyProbeRegion(content: string): string');
+    expect(helperSource).toContain('stripAnsiScreenText(content).split(/\\r?\\n/)');
+    expect(helperSource).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
+    expect(probeStart).toBeGreaterThan(-1);
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
   });
@@ -692,7 +699,7 @@ describe('worker pipe initial screen ordering', () => {
     const helper = source.slice(helperStart, helperEnd);
 
     expect(helperStart).toBeGreaterThan(-1);
-    expect(helper).toContain('if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;');
+    expect(helper).toContain('if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || (!be.captureCurrentScreen && !be.captureViewport && !cliAdapter?.isSessionBusy)) return;');
     expect(helper).toContain('if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;');
     expect(helper).not.toContain('pendingMessages.length > 0');
   });

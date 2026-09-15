@@ -39,6 +39,45 @@ export interface DispatchMessages {
   mentionedOpenIds: string[];
 }
 
+export type ProjectDispatchSyncStatus = 'pending' | 'in_progress' | 'blocked' | 'failed';
+
+export interface ProjectDispatchSyncAction {
+  action: 'dispatch';
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners?: string[];
+  status?: ProjectDispatchSyncStatus;
+  progress?: number;
+}
+
+/**
+ * Build the project-card mutation that mirrors a dispatch.
+ *
+ * `--into` is coordination inside an existing workstream, not a fresh
+ * lifecycle event. It may rename the workstream explicitly, but must not
+ * revive completed work, reset progress, or clear the recorded owners.
+ */
+export function buildProjectDispatchSyncAction(input: {
+  existingDispatch: boolean;
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners: string[];
+  status: ProjectDispatchSyncStatus;
+  progress: number;
+}): ProjectDispatchSyncAction {
+  const base: ProjectDispatchSyncAction = {
+    action: 'dispatch',
+    dispatchRoot: input.dispatchRoot,
+    title: input.title,
+    purpose: input.purpose,
+  };
+  return input.existingDispatch
+    ? base
+    : { ...base, owners: input.owners, status: input.status, progress: input.progress };
+}
+
 const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 
 /**
@@ -278,10 +317,11 @@ export async function foldableChatSessionAppIds(input: {
       || session.scope !== 'chat'
       || !session.larkAppId
       || session.chatId !== input.targetChatId
-      // These chat-scoped sessions deliberately use isolated routing keys and
-      // can never be reached through the ordinary (chatId, appId) slot.
-      || session.deferredScheduleRun
-      || session.vcMeetingReceiver) continue;
+      // A deferred scheduled run deliberately uses an isolated routing key and
+      // can never be reached through the ordinary (chatId, appId) slot. (A VC
+      // meeting agent is now an ordinary chat-scope session — Plan B — so it IS
+      // foldable and is intentionally NOT excluded here.)
+      || session.deferredScheduleRun) continue;
     candidates.add(session.larkAppId);
   }
 

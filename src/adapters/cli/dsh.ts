@@ -2,9 +2,12 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { resolveCommand } from './registry.js';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
+import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
 function runnerPath(): string {
   // Source-level worker integration tests execute through tsx and need the
@@ -28,46 +31,83 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured] : ['~/.dsh'];
+}
+
 export function createDshAdapter(pathOverride?: string): CliAdapter {
-  // Resolve the wrapped `dsh-jsonrpc-agent` binary lazily, on first buildArgs
+  // Resolve the wrapped `dsh` binary lazily, on first buildArgs
   // (spawn time), so constructing the adapter during `botmux setup` doesn't
   // shell out via resolveCommand. resolvedBin is the node runner, not dsh
   // itself.
-  const rawDshBin = pathOverride ?? 'dsh-jsonrpc-agent';
+  const rawDshBin = pathOverride ?? 'dsh';
   let cachedDshBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh' }));
   return {
     id: 'dsh',
-    // The runner writes its vendored cordis.yml and session JSONL under
-    // ~/.botmux/dsh/. Keep the whole dir REAL under the file sandbox so
-    // both survive (see adapters CLAUDE.md sandbox notes). Pre-created in
-    // buildArgs so the sandbox's keepExisting filter doesn't drop it.
-    authPaths: ['~/.botmux/dsh'],
+    // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
+    // its generated composition + sessions under ~/.dsh/botmux/ and
+    // ~/.dsh/sessions/botmux/. Keep the whole native dsh home REAL under the
+    // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
+    // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
+    // drop it.
+    get authPaths(): string[] { return dshAuthPaths(); },
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
-    // by the runner. Declare it so the file sandbox can re-expose its bin dir
-    // when it lives under /run (fnm/nvm) — else --tmpfs /run masks it and the
-    // in-sandbox spawn ENOENTs into a crash-loop. Same lazy resolve+cache as
+    // by the runner. Declare its CANONICAL path so the file sandbox re-exposes
+    // its bin dir when it lives under /run (fnm/nvm) — else --tmpfs /run masks
+    // it and the in-sandbox spawn ENOENTs into a crash-loop. Must match the
+    // path handed to --dsh-bin below (both canonical via resolveCommandReal) so
+    // the authorized dir and the spawned path agree. Same lazy resolve+cache as
     // buildArgs; only an executable path, never the cwd.
     sandboxExtraExecPaths() {
-      return [(cachedDshBin ??= resolveCommand(rawDshBin))];
+      return [(cachedDshBin ??= resolveCommandReal(rawDshBin))];
     },
 
-    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model }) {
-      // Pre-create the persistent dsh dir in the real HOME before the worker
-      // enters the sandbox: the sandbox's keepExisting filter drops authPaths
-      // that don't exist yet, and the runner can't create them from inside.
-      mkdirSync(join(homedir(), '.botmux', 'dsh'), { recursive: true });
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
+    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
+      // Pre-create the native dsh home + sessions subdir in the real HOME
+      // before the worker enters the sandbox: the sandbox's keepExisting
+      // filter drops authPaths that don't exist yet, and the runner can't
+      // create them from inside.
+      const dshHome = join(homedir(), '.dsh');
+      const activeDshHome = configuredDshHome();
+      mkdirSync(dshHome, { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
+      mkdirSync(join(activeDshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
-        runnerPath(),
+        runnerArgv0('dsh-runner', runnerPath()),
         '--session-id', sessionId,
-        '--dsh-bin', (cachedDshBin ??= resolveCommand(rawDshBin)),
+        '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
       ];
       pushOpt(args, '--cwd', workingDir);
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      const profile = dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux';
+      pushOpt(args, '--dsh-profile', profile);
+      // Legacy DSH has a single provider seat. Only auto-inject into the
+      // botmux-owned default profile where we know no user question provider is
+      // present; custom profiles may intentionally carry their own provider.
+      const bridge = profile === 'botmux' ? bridgePatch() : null;
+      pushOpt(args, '--bridge-patch', bridge?.patchPath);
+      // Per-bot turn timeout override; undefined → runner default (10 min).
+      pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
+        ? String(turnTimeoutMs)
+        : undefined);
       return args;
     },
 
@@ -94,7 +134,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     systemHints: [],
     injectsSessionContext: true,
     altScreen: false,
-    modelChoices: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    modelChoices: CLI_MODEL_CHOICES['dsh'],
   };
 }
 

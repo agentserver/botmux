@@ -58,6 +58,17 @@ export interface MessageListenerData {
     includeMsgTypes?: string[];
     scope?: 'top_level';
   };
+  /**
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message. Keywords are case-insensitive substrings. matchMode 'any'
+   * (default) needs one keyword to hit; 'all' needs every keyword to hit.
+   * V1 is keyword-only: regexes are not evaluated on the daemon main loop
+   * (catastrophic-backtracking DoS risk).
+   */
+  contentPolicy?: {
+    includeKeywords?: string[];
+    matchMode?: 'any' | 'all';
+  };
 }
 
 export interface MessageListenerPreviewItem {
@@ -165,6 +176,12 @@ export function hashChatId(hash = location.hash): string | null {
   const [, query = ''] = hash.split('?');
   const chatId = new URLSearchParams(query).get('chatId')?.trim();
   return chatId || null;
+}
+
+export function hashBotId(hash = location.hash): string | null {
+  const [, query = ''] = hash.split('?');
+  const botId = new URLSearchParams(query).get('botId')?.trim();
+  return botId || null;
 }
 
 export function roleKey(larkAppId: string, chatId: string): string {

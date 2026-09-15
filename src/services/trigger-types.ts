@@ -1,4 +1,4 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting';
+export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
@@ -39,6 +39,7 @@ export interface TriggerRequest {
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
     topicMessage?: string | null;
+    title?: string;
   };
   options?: {
     dryRun?: boolean;
@@ -71,7 +72,7 @@ export interface TriggerRequest {
      *  freshly-spawned session; ignored when folding into an existing worker.
      *  Empty/omitted → the bot's configured default. */
     model?: string;
-    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
+    /** Per-turn reasoning effort. Same
      *  fresh-spawn-only semantics as `model`. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   };
@@ -153,6 +154,16 @@ export interface TriggerResponse {
   /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
    *  (follow-up async turn on an existing session). */
   turnIdempotencyKey?: string;
+  /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
+   *  unrelated to the daemon-side `idempotencyKey` lease above).
+   *  - `accepted`  — first delivery under this key; it was dispatched.
+   *  - `duplicate` — same key + same body as an earlier delivery; NOT dispatched,
+   *                  `firstTriggerId` names the turn that actually ran. */
+  idempotency?: {
+    key: string;
+    action: 'accepted' | 'duplicate';
+    firstTriggerId?: string;
+  };
   /** True when this response reused an EXISTING session for the idempotency key
    *  (no new session created, no re-dispatch) instead of creating a fresh one.
    *  Absent/false on the first (creating) call and on non-idempotent triggers. */
@@ -228,6 +239,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     }
     if (typeof topicMessage === 'string' && (!topicMessage.trim() || Array.from(topicMessage.trim()).length > 200)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
+    }
+    const title = raw.presentation.title;
+    if (title !== undefined && (typeof title !== 'string' || !title.trim() || Array.from(title.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.title must contain 1 to 200 characters' } };
     }
   }
   if (waitForFinalOutput && target.kind !== 'turn') {

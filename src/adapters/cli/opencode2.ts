@@ -1,9 +1,9 @@
-import { existsSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
 import {
   detectOpenCodeSubmit,
+  isOpenCodeSessionBusy,
   isOpenCodeSessionId,
   latestOpenCodeSessionForBotmuxSession,
   listOpenCodeResumableSessions,
@@ -100,11 +100,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string) {
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline('v2');
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -112,7 +113,9 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long or multiline prompts may be split into key events.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -133,8 +136,17 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    busyPattern: undefined,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v2');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.config/opencode/skills',
     // botmux ask-hook：V2 插件（新插件 API），写入 V2 全局插件发现目录。
     // ⚠️ beta 已知上游问题（next-17082）：HOME 是符号链接（如 /home→/data00/home）的

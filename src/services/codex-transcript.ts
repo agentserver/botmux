@@ -53,6 +53,8 @@ import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
+// cot-subject 只用语言内建，等价于内联，不违反本模块 dependency-free 口径。
+import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
 
 const IS_LINUX = platform() === 'linux';
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
@@ -204,11 +206,18 @@ export interface CodexBridgeEvent {
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
    *   - 'assistant_final' closes the currently-collecting turn with output
-   *   - 'turn_aborted' closes it without producing fallback output */
-  kind: 'user' | 'assistant_final' | 'turn_aborted';
+   *   - 'turn_aborted' closes it without producing fallback output
+   *   - 'turn_bind' adds a provider turn id to an already-started turn
+   *     without starting, closing, or otherwise advancing the queue
+   *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
+   *     output) attributed to the collecting turn for the CoT message; it
+   *     never starts or closes a turn */
+  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
-   *  user, output_text for assistant). */
+   *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
+  cotEntries?: CodexCotEntry[];
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
@@ -219,16 +228,141 @@ export interface CodexBridgeEvent {
    *  Raw provider payloads stay in the rollout/Web terminal. */
   terminalErrorSummary?: string;
   sourceSessionId?: string;
+  /** Native provider turn id when the transcript format exposes one. Bridges
+   *  can use it to bind cosmetic/terminal events to the exact started turn
+   *  instead of relying solely on whichever turn is currently collecting. */
+  sourceTurnId?: string;
+  /** The transcript parser has positive evidence that this user record starts
+   * a distinct native turn while an older id-less turn remains open. */
+  preserveCollecting?: boolean;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
 }
 
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts /
+ *  `TranscriptCotEntry` in claude-transcript.ts — redeclared structurally to
+ *  keep this module dependency-free. */
+export type CodexCotEntry =
+  | { kind: 'thinking'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从原始 arguments / input / action 提取的单行主题（≤1000）；
+     *  无可用字段时不带此键。 */
+    subject?: string;
+  }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Per-entry truncation caps for the CoT tool timeline (same rationale and
+ *  values as claude-transcript's): args/outputs can be hundreds of KB, the
+ *  bubble only needs a recognisable preview. */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** 组装 tool_call 节点：args 截断、subject 传输层截断，主题为空时不带键。 */
+function toolCallEntry(id: string, name: string, args: string, rawSubject: string): CodexCotEntry {
+  const subject = boundSubjectForTransport(rawSubject);
+  return {
+    kind: 'tool_call', id, name,
+    args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+    ...(subject ? { subject } : {}),
+  };
+}
+
+/** Codex shell outputs are usually a JSON string `{"output":"…","metadata":…}`;
+ *  unwrap to the inner output when that shape parses, otherwise show the raw
+ *  string (custom tools / newer formats). */
+function stringifyCodexToolOutput(output: unknown): string {
+  if (typeof output !== 'string') {
+    try { return output === undefined ? '' : JSON.stringify(output); } catch { return ''; }
+  }
+  if (output.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed && typeof parsed === 'object' && typeof parsed.output === 'string') return parsed.output;
+    } catch { /* not the wrapped shape — fall through to raw */ }
+  }
+  return output;
+}
+
+/**
+ * Extract CoT (thinking process) entries from one Codex rollout
+ * `response_item` payload. Returns [] for payload types that don't belong in
+ * the thinking timeline (user/assistant messages, ghost snapshots, …).
+ *
+ *   - `reasoning` → thinking text. Codex records the display summary in
+ *     `summary[]` (`summary_text` blocks — what the TUI shows) and, for some
+ *     providers, raw CoT in `content[]` (`reasoning_text`); prefer the
+ *     summary, fall back to raw.
+ *   - `function_call` / `custom_tool_call` / `local_shell_call` /
+ *     `web_search_call` → tool_call (name + truncated args).
+ *   - `function_call_output` / `custom_tool_call_output` → tool_result
+ *     (unwrapped + truncated output).
+ */
+export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
+  if (!p || typeof p !== 'object') return [];
+  if (p.type === 'reasoning') {
+    const texts: string[] = [];
+    for (const b of Array.isArray(p.summary) ? p.summary : []) {
+      if (b?.type === 'summary_text' && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+    }
+    if (texts.length === 0) {
+      for (const b of Array.isArray(p.content) ? p.content : []) {
+        if ((b?.type === 'reasoning_text' || b?.type === 'text') && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+      }
+    }
+    return texts.length > 0 ? [{ kind: 'thinking', text: texts.join('\n\n') }] : [];
+  }
+  // 四种 tool_call 形态的主题都在截断**之前**从原始字符串 / 对象上取：
+  // function_call 的 arguments 是 JSON 字符串，custom_tool_call 的 input 是裸
+  // 字符串（apply_patch / 脚本），local_shell_call / web_search_call 的 action
+  // 是对象——截断后的 JSON 解析不出主题。
+  if (p.type === 'function_call' && typeof p.name === 'string') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    const args = typeof p.arguments === 'string' ? p.arguments : '';
+    return [toolCallEntry(id, p.name, args, subjectFromArgsString(args))];
+  }
+  if (p.type === 'custom_tool_call' && typeof p.name === 'string' && typeof p.call_id === 'string' && p.call_id) {
+    const args = typeof p.input === 'string' ? p.input : '';
+    return [toolCallEntry(p.call_id, p.name, args, subjectFromArgsString(args))];
+  }
+  if (p.type === 'local_shell_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [toolCallEntry(id, 'shell', args, subjectFromInputObject(p.action))];
+  }
+  if (p.type === 'web_search_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [toolCallEntry(id, 'web_search', args, subjectFromInputObject(p.action))];
+  }
+  if ((p.type === 'function_call_output' || p.type === 'custom_tool_call_output') && typeof p.call_id === 'string' && p.call_id) {
+    const result = stringifyCodexToolOutput(p.output);
+    return result.length > 0 ? [{ kind: 'tool_result', id: p.call_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) }] : [];
+  }
+  return [];
+}
+
 export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
 export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
 export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
 export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
+/** Model gateway / upstream service failure (5xx, gRPC stream cancel, …):
+ *  the request reached the model service but the SERVER side failed. Distinct
+ *  from `codex_connection_failed` (client could not reach the service at all)
+ *  so the user-facing card can say "server-side transient, just retry later"
+ *  instead of pointing at the local network. */
+export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
 
 const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
@@ -305,7 +439,10 @@ function codexFailureLeaf(error: unknown): unknown {
   return current;
 }
 
-function safeFailureSummary(error: unknown): string | undefined {
+/** Bounded, redacted user-facing summary of a structured task_complete error.
+ *  Exported for the TRAE drainer, which mirrors the Codex error→failed
+ *  terminal mapping on the same payload shape. */
+export function safeFailureSummary(error: unknown): string | undefined {
   const leaf = codexFailureLeaf(error);
   let message = '';
   let code = '';
@@ -389,7 +526,11 @@ function safeFailureSummary(error: unknown): string | undefined {
     : summary;
 }
 
-function codexTaskFailureCode(error: unknown): string {
+/** Classify a structured task_complete error into a stable failure code.
+ *  Shared with the TRAE drainer (traex-transcript.ts), whose task_complete
+ *  error payloads use the same Codex-family shape — keep one classifier so
+ *  both bridges map e.g. connection failures to the same code. */
+export function codexTaskFailureCode(error: unknown): string {
   let serialized = '';
   try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
   const normalized = serialized.toLowerCase();
@@ -399,6 +540,15 @@ function codexTaskFailureCode(error: unknown): string {
   }
   if (/invalid_request|invalid request|validation|empty_string|\b400\b|\b-4003\b/.test(normalized)) {
     return CODEX_INVALID_REQUEST_ERROR_CODE;
+  }
+  // Model gateway / upstream failures: the service answered but failed
+  // server-side (proxy 5xx, gRPC stream cancel, overloaded backend). Checked
+  // BEFORE the connection branch so e.g. "gateway timeout" classifies as
+  // upstream rather than a local connectivity problem. Observed live:
+  // "upstream stream error: rpc error: code = 1 desc = Cancelled by backend
+  // [biz error]" (model gateway cancelling the stream mid-turn).
+  if (/upstream|rpc error|cancell?ed by backend|gateway|\b50[0234]\b|service unavailable|internal server error|overloaded/.test(normalized)) {
+    return CODEX_UPSTREAM_ERROR_CODE;
   }
   if (/econn|connection|network|socket|timed?\s*out|timeout|dns|enotfound/.test(normalized)) {
     return CODEX_CONNECTION_ERROR_CODE;
@@ -423,7 +573,7 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
+  events: readonly Pick<CodexBridgeEvent, 'kind' | 'text'>[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -757,6 +907,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }
+    // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
+    // become cosmetic 'cot' events. The queue attributes them to the
+    // collecting turn for the native CoT message; they never start or close
+    // a turn (the boundaries above/below stay authoritative).
+    if (obj.type === 'response_item') {
+      const cotEntries = codexCotEntriesFromResponseItem(p);
+      if (cotEntries.length > 0) {
+        events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+        continue;
+      }
+    }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
     // This is the SOLE assistant_final source. Codex assistant `response_item`
@@ -802,9 +963,10 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       });
       continue;
     }
-    // Everything else is skipped: role=developer/system instructions,
-    // reasoning, function_call*, and every assistant `response_item` message
-    // (mid-turn OR final) — the turn boundary comes only from task_complete.
+    // Everything else is skipped: role=developer/system instructions and
+    // every assistant `response_item` message (mid-turn OR final) — the turn
+    // boundary comes only from task_complete. Reasoning / tool calls surface
+    // as cosmetic 'cot' events above, never as boundaries.
   }
   return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
 }
@@ -812,8 +974,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
   if (obj?.type !== 'event_msg' || obj.payload?.type !== 'thread_settings_applied') return undefined;
   const raw = obj.payload.thread_settings;
-  const serviceTier = raw?.service_tier;
-  if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  // Codex omits service_tier when /fast is disabled; that is an applied
+  // default-tier snapshot, not a malformed settings record.
+  const rawServiceTier = raw.service_tier;
+  const serviceTier = rawServiceTier === undefined || rawServiceTier === ''
+    ? 'default'
+    : rawServiceTier;
+  if (typeof serviceTier !== 'string') return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
   // Effort follows in-session changes made through Codex's own model controls.
   // Codex records it both at the top level and under collaboration_mode.settings;

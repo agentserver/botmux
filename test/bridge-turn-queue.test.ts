@@ -13,6 +13,7 @@
  *     yet (e.g. Claude is still in tool-use mid-turn)
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
@@ -87,9 +88,32 @@ describe('BridgeTurnQueue', () => {
     expect(q.drainEmittable()).toEqual([]);
   });
 
-  it('still forwards a non-rate API error (server_error) as the turn text', () => {
-    // server_error / auth failures have no `limited` surface, so their text is
-    // the user's only failure signal — keep attributing them (pre-existing behavior).
+  it('keeps 429 on the limited path when turn_duration follows it', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_limited');
+    q.ingest([
+      user('u-limit'),
+      {
+        type: 'assistant',
+        uuid: 'rl-duration',
+        isApiErrorMessage: true,
+        error: 'rate_limit',
+        apiErrorStatus: 429,
+        message: { role: 'assistant', content: [], stop_reason: 'stop_sequence' },
+      },
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-limit' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_limited',
+        rateLimited: true,
+      }),
+    ]);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('records a structured retryable failure without treating its error text as an answer', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');
     const srvErr: TranscriptEvent = {
@@ -100,9 +124,97 @@ describe('BridgeTurnQueue', () => {
       message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal server error' }], stop_reason: 'stop_sequence' },
     };
     q.ingest([user('u1'), srvErr]);
-    const ready = q.drainEmittable();
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
     expect(ready.length).toBe(1);
-    expect(ready[0].assistantUuids).toEqual(['se1']);
+    expect(ready[0].assistantUuids).toEqual([]);
+    expect(ready[0].terminalOutcome).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+  });
+
+  it('preserves an unexpected EOF failure when turn_duration closes the boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_original');
+    const eof: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+    const duration: TranscriptEvent = {
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid: 'fixture-duration',
+    };
+
+    q.ingest([user('u1'), eof, duration]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_original',
+        assistantUuids: [],
+        terminalOutcome: {
+          status: 'failed',
+          errorCode: 'provider_unexpected_eof',
+          retryable: true,
+        },
+      }),
+    ]);
+  });
+
+  it('treats a bare turn_duration boundary as completed like next-turn-start', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_boundary_only');
+    q.ingest([
+      user('u-boundary'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-only' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_boundary_only',
+        terminalOutcome: { status: 'completed' },
+      }),
+    ]);
+  });
+
+  it('keeps visible text when stop_reason is null and turn_duration closes the turn', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_null_reason');
+    q.ingest([
+      user('u-null-reason'),
+      {
+        type: 'assistant',
+        uuid: 'a-null-reason',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Visible successful answer' }],
+          stop_reason: null,
+        },
+      },
+      {
+        type: 'system',
+        subtype: 'stop_hook_summary',
+        uuid: 'stop-hook-null-reason',
+        preventedContinuation: false,
+      } as TranscriptEvent,
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-null-reason' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_null_reason',
+        assistantUuids: ['a-null-reason'],
+        terminalOutcome: { status: 'completed' },
+      }),
+    ]);
   });
 
   it('back-to-back Lark messages without idle: each turn keeps its own uuids', () => {
@@ -493,6 +605,117 @@ describe('BridgeTurnQueue', () => {
       q.mark('t1');
       q.ingest([user('u1'), assistant('a1', 'reply')]);
       expect(q.peek()[0].sourceJsonlPath).toBeUndefined();
+    });
+  });
+
+  describe('synthetic no-model-reply assistant records', () => {
+    // Claude Code bridge-resume placeholder (see isSyntheticNoModelReplyEvent):
+    // visible text, terminal stop_reason, isApiErrorMessage:false — every
+    // attribute the queue used to read as "the model's final answer", but no
+    // model call happened and the Lark message was never answered.
+    function metaContinue(uuid: string): TranscriptEvent {
+      return {
+        type: 'user', uuid, isMeta: true,
+        message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
+      } as TranscriptEvent;
+    }
+    function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model, stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] },
+      } as TranscriptEvent;
+    }
+
+    it('closes the pending Lark turn as a retryable failure instead of attributing the placeholder text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].assistantUuids).toEqual([]);
+      expect(ready[0].terminalObserved).toBe(true);
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+    });
+
+    it('control: the same record served by a real model is the completed reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['s1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    it('does not synthesise a headless local turn out of the placeholder', () => {
+      const q = new BridgeTurnQueue();
+      q.ingest([metaContinue('m1'), syntheticNoReply('s1')]);
+      expect(q.size()).toBe(0);
+      // control: a real headless reply still gets its local turn
+      const q2 = new BridgeTurnQueue();
+      q2.ingest([metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      expect(q2.size()).toBe(1);
+      expect(q2.peek()[0].isLocal).toBe(true);
+    });
+
+    // The placeholder is the WEAKEST terminal signal there is: it says "no model
+    // call happened". It must never overwrite a stronger outcome the same turn
+    // already carries, because worker.ts (`terminalOutcome.status !== 'completed'
+    // → continue`) would then withhold the real answer text AND let the daemon
+    // post a failure card for a turn that was in fact answered.
+    function realReply(uuid: string, text: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: false,
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+      } as TranscriptEvent;
+    }
+    function apiErrorLine(uuid: string): TranscriptEvent {
+      return {
+        type: 'assistant', uuid, isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 500,
+        message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 500' }] },
+      } as TranscriptEvent;
+    }
+
+    it('does not downgrade a turn that already completed with a real reply', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({ status: 'completed' });
+    });
+
+    // The API-error arm does NOT share that rule: an error line is authoritative
+    // execution metadata, and the `end_turn` before it is, in the connection-lost
+    // case, a force-closed half sentence. The error must win so the turn stays
+    // `failed` + retryable - the only shape ordinary-turn-recovery acts on
+    // (ordinary-turn-recovery.ts: `status !== 'failed' || retryable !== true`
+    // → no continuation). Maintainer ruling on PR #1330.
+    it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      const ready = q.drainEmittable();
+      expect(ready.length).toBe(1);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      });
+    });
+
+    it('still records the failure when the turn has no earlier terminal', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), syntheticNoReply('s1')]);
+      const ready = q.drainEmittable();
+      expect(ready[0].terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+      });
+      expect(ready[0].terminalObserved).toBe(true);
     });
   });
 
@@ -1036,6 +1259,86 @@ describe('BridgeTurnQueue', () => {
       expect(ready[0].isLocal).toBe(true); // emitted, not dropped
       const t1 = q.peek().find(t => t.turnId === 't1');
       expect(t1?.started).toBe(false); // mark untouched
+    });
+  });
+
+  /**
+   * Head-of-line drop must report the turn so the worker can retire its
+   * durable journal entry.
+   *
+   * The bug: `handleTurnStart` spliced a text-less collecting turn out of the
+   * queue, so it never reached `drainEmittable` — the ONLY place the worker
+   * clears the journal. The entry survived, and every later restart re-marked
+   * it and re-drained the transcript from its recorded offset. MEASURED on a
+   * live session: one entry restored across six consecutive restarts, twice
+   * resurfacing an hours-old provider error as a fresh 「本轮执行失败」card.
+   *
+   * These assert the REPORTING contract only (the queue is pure — it cannot
+   * touch the filesystem). Worker-side wiring is asserted separately.
+   */
+  describe('head-of-line drop → journal cleanup reporting', () => {
+    it('reports a Lark turn dropped head-of-line so its journal entry can be retired', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('lark-1', makeFingerprint('first message'), 100, makeFingerprintFull('first message'));
+      // The turn starts but Claude never writes assistant text for it...
+      q.ingest([user('u1', 'first message')]);
+      expect(q.peek()[0].started).toBe(true);
+      expect(q.takeDroppedNeedingJournalClear()).toEqual([]); // nothing dropped yet
+      // ...then a newer turn-start arrives → head-of-line drop.
+      q.ingest([user('u2', 'second message')]);
+      const dropped = q.takeDroppedNeedingJournalClear();
+      expect(dropped.map(t => t.turnId)).toEqual(['lark-1']);
+      // The turn really is gone from the queue (this is what made it unreachable).
+      expect(q.peek().some(t => t.turnId === 'lark-1')).toBe(false);
+    });
+
+    it('is drain-once: a second take returns nothing', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('lark-1', makeFingerprint('first message'), 100, makeFingerprintFull('first message'));
+      q.ingest([user('u1', 'first message')]);
+      q.ingest([user('u2', 'second message')]);
+      expect(q.takeDroppedNeedingJournalClear()).toHaveLength(1);
+      // Without this, the worker would re-clear (harmless) or re-log forever.
+      expect(q.takeDroppedNeedingJournalClear()).toEqual([]);
+    });
+
+    it('does NOT report synthesised local turns — they never had a journal entry', () => {
+      const q = new BridgeTurnQueue();
+      // A local turn is synthesised by the queue itself (no Lark mark behind
+      // it), so reporting one would make the worker clear an entry it never
+      // wrote — and `local-<uuid>` can collide with nothing, so the clear
+      // would be a silent no-op that still burns a journal read+write.
+      q.ingest([user('local-u1', 'typed in the terminal')]);
+      expect(q.peek()[0].isLocal).toBe(true);
+      q.ingest([user('local-u2', 'typed again')]);
+      expect(q.takeDroppedNeedingJournalClear()).toEqual([]);
+    });
+
+    it('does NOT report a turn that produced assistant text (it drains normally)', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('lark-1', makeFingerprint('first message'), 100, makeFingerprintFull('first message'));
+      q.ingest([user('u1', 'first message'), assistant('a1', 'a real answer')]);
+      q.ingest([user('u2', 'second message')]);
+      // It has text, so it stays queued and the worker retires its journal
+      // entry the normal way, at drainEmittable.
+      expect(q.takeDroppedNeedingJournalClear()).toEqual([]);
+      expect(q.drainEmittable({ terminalBoundary: true }).map(t => t.turnId)).toContain('lark-1');
+    });
+
+    it('worker.ts drains the report BEFORE the empty-ready early return', () => {
+      // Wiring, not policy: a queue that reports perfectly is inert if nobody
+      // drains it. Ordering matters — a head-of-line drop usually lands on a
+      // tick that emits nothing, so draining after `if (ready.length === 0)
+      // return;` would skip exactly the case this fix exists for.
+      const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+      const fn = source.slice(source.indexOf('function emitReadyTurns('));
+      const drainAt = fn.indexOf('takeDroppedNeedingJournalClear()');
+      const earlyReturnAt = fn.indexOf('if (ready.length === 0) return;');
+      expect(drainAt).toBeGreaterThan(-1);
+      expect(earlyReturnAt).toBeGreaterThan(-1);
+      expect(drainAt).toBeLessThan(earlyReturnAt);
+      // ...and it must actually retire the journal entry, not just log.
+      expect(fn.slice(drainAt, earlyReturnAt)).toContain('journalBridgeTurnClear(');
     });
   });
 });

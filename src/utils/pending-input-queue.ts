@@ -1,4 +1,5 @@
-import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
+import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface PendingCliInput {
   content: string;
@@ -15,7 +16,27 @@ export interface PendingCliInput {
   codexAppSteerable?: true;
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  trustedCaller?: TrustedCaller;
+  /** Stable authenticated controller of the surrounding session/task. */
+  trustedController?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
+  /** Best-effort CLI-native title to apply after this exact user input has
+   * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
+   * does not fall back to Botmux's injected routing envelope. */
+  nativeSessionTitle?: string;
+  /** Source text for Codex App semantic title generation. Plain TUI adapters
+   * keep only nativeSessionTitle and ignore this prompt. */
+  nativeSessionTitlePrompt?: string;
+  /**
+   * mojo only: the credential snapshot that arrived WITH this turn.
+   *
+   * Carried on the queue item rather than applied at IPC-receive time because the
+   * two are not simultaneous — a turn can sit queued while later messages arrive.
+   * Applying on receipt made two queued credential turns collapse: queueing B then
+   * C executed as A → C → C instead of A → B → C, because both patches landed
+   * before either turn ran.
+   */
+  mojoLivePatch?: import('../adapters/backend/mojo-types.js').MojoLivePatch;
   /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
    *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
    *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
@@ -84,7 +105,14 @@ export function mergeQueuedCliInput(
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
+    || tail.nativeSessionTitle || next.nativeSessionTitle
+    || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent) return false;
+  // Caller attribution is part of the logical envelope. Older code merged two
+  // queued messages and kept only the later turnId while silently retaining no
+  // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
+  // legacy callers fail closed and stay as separate turns.
+  if (!sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
@@ -111,11 +139,13 @@ export function pendingInputAllowsTypeAhead(
  * launch-argument path; adopt observes an already-running process. */
 export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
+  durableInitialPromptViaArgs?: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
   queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
+    && !opts.durableInitialPromptViaArgs
     && !opts.adoptMode
     && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }

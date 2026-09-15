@@ -4,7 +4,7 @@ import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
@@ -28,6 +28,58 @@ const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}`;
 
 /** Guard so the fallback self-heal runs at most once in this worker process. */
 let serverGlobalEnvScrubbed = false;
+
+/**
+ * True when a tmux client's stderr reports a CONNECTION-level failure — the
+ * client never got an answer from the shared server, so the error proves
+ * nothing about any particular session/pane:
+ *   - "error connecting to <socket> (Connection refused)" — Linux fails
+ *     unix-socket connect() with an INSTANT clean ECONNREFUSED when the
+ *     server's accept backlog overflows. A busy-but-alive server (stalled a
+ *     couple of seconds under load while hundreds of workers probe it every
+ *     second) mass-produces exactly this error.
+ *   - "error connecting to <socket> (No such file or directory)" — socket file
+ *     missing (server down, or the file was cleaned from /tmp under a live
+ *     server).
+ *   - "lost server" / "server exited unexpectedly" — the connection died
+ *     mid-command.
+ *
+ * Probes must classify these as 'unknown', NEVER as an authoritative
+ * 'missing': on 2026-08-20 a few seconds of backlog overflow on the default
+ * server made every worker's liveness probe read clean-exit "error connecting"
+ * as "pane gone", and the daemon tore down / force-FRESHed dozens of live
+ * sessions across all bots simultaneously.
+ *
+ * Deliberately NOT matched: "no server running on <socket>" — the client did
+ * determine that no server owns the socket, and a not-running server provably
+ * has no sessions, so that one stays an authoritative 'missing'.
+ */
+export function isTmuxServerLevelErrorText(stderrText: string): boolean {
+  return /error connecting to|lost server|server exited unexpectedly/i.test(stderrText);
+}
+
+/**
+ * True when a thrown exec*Sync error represents the caller's own `timeout`
+ * deadline firing — regardless of the exit-status shape Node attached.
+ *
+ * Node reports a spawnSync timeout as `error.code === 'ETIMEDOUT'` while ALSO
+ * reporting whatever the child managed to do around the kill. Normally the
+ * child dies from the kill signal (`status: null, signal: 'SIGTERM'`), but
+ * under heavy load the client can complete and exit cleanly in the same window
+ * the deadline fires — the throw then carries `status: 0/1, signal: null` PLUS
+ * the ETIMEDOUT error. 2026-08-23: exactly that shape escaped every
+ * "clean numeric exit ⇒ the server answered deterministically" classifier
+ * during a post-outage mass cold-restart (261 sessions rebuilt in ~40s after
+ * the shared server died): `new-session` had actually succeeded server-side,
+ * but the launch was classified as a deterministic rejection, not retried, and
+ * the worker died user-visibly ("会话启动失败: spawnSync tmux ETIMEDOUT").
+ *
+ * A deadline is NEVER an authoritative server answer. Every tmux classifier
+ * must check this BEFORE any status-shape branch.
+ */
+export function isExecTimeoutError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null | undefined)?.code === 'ETIMEDOUT';
+}
 
 /**
  * TmuxBackend — session backend using tmux for process persistence.
@@ -96,18 +148,39 @@ export class TmuxBackend implements SessionBackend {
     return TmuxBackend.probeSession(name) === 'exists';
   }
 
+  static assertInstanceIdentity(name: string, expected: string): void {
+    const probe = TmuxBackend.probeSession(name);
+    if (probe === 'missing') return;
+    let actual = '';
+    try {
+      actual = execFileSync('tmux', ['show-environment', '-t', name, 'BOTMUX_CODEX_INSTANCE_BINDING'],
+        { encoding: 'utf8', timeout: 5000, env: tmuxEnv() }).trim();
+    } catch { /* unknown/missing identity is not permission to attach */ }
+    if (actual !== `BOTMUX_CODEX_INSTANCE_BINDING=${expected}`) {
+      throw new Error('Codex instance identity mismatch: existing tmux session preserved; attachment refused');
+    }
+  }
+
   /**
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
-   * the session is absent — INCLUDING "no server running". Both collapse to
-   * 'missing' here. 'missing' is NOT a destructive signal on restore: whether a
-   * single pane died (solo crash) or the whole server is gone (machine reboot),
-   * the CLI transcript on disk is still resumable, so restore keeps the session
-   * active and cold-resumes it on the next message (see restoreActiveSessions).
+   * the session is absent — including "no server running" (a not-running server
+   * provably has no sessions). 'missing' is NOT a destructive signal on restore:
+   * whether a single pane died (solo crash) or the whole server is gone (machine
+   * reboot), the CLI transcript on disk is still resumable, so restore keeps the
+   * session active and cold-resumes it on the next message (see
+   * restoreActiveSessions).
+   *
+   * A clean non-zero exit whose stderr is a CONNECTION-level failure ("error
+   * connecting to <socket>", "lost server", …) is 'unknown', not 'missing': the
+   * client never reached the server, so it proved nothing about this session.
+   * Linux fails unix-socket connect() with instant ECONNREFUSED when the
+   * server's accept backlog overflows — a busy-but-alive shared server briefly
+   * looks exactly like this, and 2026-08-20 that misread made kill-verify /
+   * liveness paths treat dozens of live sessions as gone at once.
    * Anything else — a timeout (signal/killed) or a spawn failure (binary not on
    * PATH → ENOENT, not executable → EACCES; neither carries a numeric exit
-   * status) — means we never got an answer → 'unknown', so a flaky/unavailable
-   * tmux can't be mistaken for a gone session either.
+   * status) — also means we never got an answer → 'unknown'.
    *
    * Uses execFileSync (NOT a shell string): running tmux directly keeps a
    * missing/unrunnable binary as ENOENT/EACCES. A shell would instead surface
@@ -116,10 +189,22 @@ export class TmuxBackend implements SessionBackend {
    */
   static probeSession(name: string): SessionProbe {
     try {
-      execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
+      execFileSync('tmux', ['has-session', '-t', name], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: tmuxEnv(),
+        timeout: 3000,
+      });
       return 'exists';
     } catch (e: any) {
-      if (e && typeof e.status === 'number' && !e.signal) return 'missing';
+      // Deadline first: a timed-out client can surface a clean numeric exit
+      // when its completion races the kill (see isExecTimeoutError) — that is
+      // still "no answer", never an authoritative 'missing'.
+      if (isExecTimeoutError(e)) return 'unknown';
+      if (e && typeof e.status === 'number' && !e.signal) {
+        const stderrText = (e.stderr?.toString?.() ?? '').trim();
+        if (isTmuxServerLevelErrorText(stderrText)) return 'unknown';
+        return 'missing';
+      }
       return 'unknown';
     }
   }
@@ -222,6 +307,8 @@ export class TmuxBackend implements SessionBackend {
     // (once per daemon process; no-op on a server this build booted clean).
     TmuxBackend.scrubServerGlobalEnvOnce();
     this.reattaching = TmuxBackend.hasSession(this.sessionName);
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    if (this.reattaching && instanceIdentity) TmuxBackend.assertInstanceIdentity(this.sessionName, instanceIdentity);
     logger.debug(
       `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
       `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
@@ -304,6 +391,7 @@ export class TmuxBackend implements SessionBackend {
         '-s', this.sessionName,
         '-x', String(opts.cols),
         '-y', String(opts.rows),
+        ...(instanceIdentity ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
         '--',
         ...shellCommandArgv(shellSpec, script, [
           opts.cwd,
@@ -640,6 +728,11 @@ export function buildBotmuxEnvAssignments(
   injectEnv?: Record<string, string>,
 ): string[] {
   const out: string[] = [];
+  // env(1) runs AFTER the login shell's rcfiles, so stripping these only from
+  // the worker/client env is insufficient: rcfiles can reintroduce them.
+  if (env?.BOTMUX_CODEX_INSTANCE_BINDING) {
+    for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) out.push('-u', key);
+  }
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
       const val = env[key];
@@ -655,6 +748,15 @@ export function buildBotmuxEnvAssignments(
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
     }
+    // CA bundle: same treatment as proxy vars (see CA_BUNDLE_ENV_KEYS). Emitted
+    // per pane so a value the worker resolved for a sandboxed Codex reaches the
+    // CLI and overrides a stale server-global one, while a user's own value on
+    // their tmux server survives untouched for every other CLI.
+    for (const key of CA_BUNDLE_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
   // bot's provider creds win over any same-named leftover, and emitted ONLY
@@ -665,6 +767,7 @@ export function buildBotmuxEnvAssignments(
   // crossed an IPC boundary from the daemon).
   if (injectEnv) {
     for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      if (env?.BOTMUX_CODEX_INSTANCE_BINDING && ['CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL', 'BOTMUX_CODEX_INSTANCE_BINDING'].includes(key)) continue;
       out.push(`${key}=${val}`);
     }
   }

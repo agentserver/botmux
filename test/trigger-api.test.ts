@@ -41,6 +41,10 @@ describe('trigger request contract', () => {
     custom.presentation = { topicMessage: 'Build failed' };
     expect(validateTriggerRequest(custom).ok).toBe(true);
 
+    const titled = request();
+    titled.presentation = { title: 'Headless build' };
+    expect(validateTriggerRequest(titled).ok).toBe(true);
+
     const silent = request();
     silent.presentation = { topicMessage: null };
     expect(validateTriggerRequest(silent).ok).toBe(true);
@@ -50,6 +54,28 @@ describe('trigger request contract', () => {
       bad.presentation = { topicMessage };
       expect(validateTriggerRequest(bad).ok).toBe(false);
     }
+
+    for (const title of ['', 'x'.repeat(201), 42]) {
+      const bad = request() as any;
+      bad.presentation = { title };
+      expect(validateTriggerRequest(bad).ok).toBe(false);
+    }
+  });
+
+  it('accepts headless async turn triggers against an existing session', () => {
+    const req = request();
+    req.source = { type: 'headless', connectorId: 'botmux-headless-cli', requestId: 'hl_123' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    req.envelope = {
+      format: 'botmux.headless.v1',
+      sourceName: 'botmux headless',
+      trusted: false,
+      payload: { prompt: 'say hello' },
+      rawText: 'say hello',
+    };
+    req.instruction = 'say hello';
+    req.options = { asyncReturnSessionId: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
   });
 
   it('allows wait-mode turn triggers without a chatId or sessionId', () => {
@@ -325,6 +351,49 @@ describe('trigger request contract', () => {
     // guards the specific leak riff observed: model narrating the routing header
     expect(prompt.toLowerCase()).toContain('routing header');
     expect(prompt).toContain('Do not call botmux send');
+  });
+
+  // ── sentinel migration (质量①, #808 hard constraint): the nothing-to-send
+  //    sentinel lives SOLELY in <botmux_http_response_mode> now (routing/reminder
+  //    usage_silence is gated off for no-transport). This is a MIGRATION, NOT a
+  //    deletion: async settle depends on the model emitting the literal
+  //    BOTMUX_NOTHING_TO_SEND — isBridgeNothingToSendFinal requires a trailing
+  //    sentinel line → nothingToSendTurns → turn_terminal outputDisposition
+  //    'nothing_to_send', which is the ONLY signal that settles a genuine-empty
+  //    async turn to completed (else it hangs `running` until timeout). If this
+  //    test goes red because the sentinel line was removed "to fix the conflict",
+  //    that reintroduces the #808 hang — restore it, do not delete it.
+  it('carries the nothing-to-send sentinel inside http_response_mode for async turns', () => {
+    const req = request();
+    (req as any).instruction = 'Do the task.';
+    (req.options as any) = { asyncReturnSessionId: true };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_async');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    // The sentinel must sit INSIDE the response-mode block, not leak elsewhere.
+    const modeStart = prompt.indexOf('<botmux_http_response_mode');
+    const modeEnd = prompt.indexOf('</botmux_http_response_mode>');
+    const sentinelIdx = prompt.indexOf('BOTMUX_NOTHING_TO_SEND');
+    expect(sentinelIdx).toBeGreaterThan(modeStart);
+    expect(sentinelIdx).toBeLessThan(modeEnd);
+  });
+
+  it('carries the sentinel for wait-mode turns too (settle path covers both async + wait)', () => {
+    const req = request();
+    (req as any).instruction = 'Do the task.';
+    (req.options as any) = { waitForFinalOutput: true, timeoutMs: 120_000 };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_wait');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
+  it('emits NO sentinel for a plain (non-async/non-wait) webhook — no response-mode block at all', () => {
+    const req = request();
+    (req as any).instruction = 'Do a thing.';
+    (req.options as any) = {};
+    const prompt = buildUntrustedEventPrompt(req, 'trg_plain');
+    expect(prompt).not.toContain('<botmux_http_response_mode');
+    expect(prompt).not.toContain('BOTMUX_NOTHING_TO_SEND');
   });
 
   it('no response-mode block without wait/async options (plain webhook delivery)', () => {

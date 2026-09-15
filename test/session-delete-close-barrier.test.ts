@@ -86,7 +86,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(markerPath)).toBe(false);
 
       releaseCleanup();
-      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false, known: true });
+      await expect(pending).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
       stopDashboardEvents();
       const closePatch = dashboardEvents.find(event =>
         event.type === 'session.update'
@@ -116,6 +116,61 @@ describe('daemon close barrier used by botmux delete', () => {
       );
     } finally {
       releaseCleanup();
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('keeps a document watch when one comment-thread session closes', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-doc-thread-close-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-doc-thread-close');
+    const fileToken = 'doc-thread-close';
+    const watchAnchor = docSubsStore.docWatchAnchor(fileToken);
+    docSubsStore.putDocSubscription(dataDir, 'app-doc-thread-close', {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: watchAnchor,
+      scope: 'chat',
+      chatId: watchAnchor,
+      commentTriggerMode: 'mention-only',
+      managedBy: 'watch-comment',
+      createdAt: Date.now(),
+    });
+    const unsubscribe = vi.spyOn(docComment, 'unsubscribeDocFile');
+
+    try {
+      const commentAnchor = docSubsStore.docCommentThreadAnchor(fileToken, 'comment-1');
+      const session = sessionStore.createSession(commentAnchor, commentAnchor, 'doc comment thread', 'group');
+      session.larkAppId = 'app-doc-thread-close';
+      session.scope = 'chat';
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        larkAppId: 'app-doc-thread-close',
+        chatId: commentAnchor,
+        chatType: 'group',
+        scope: 'chat',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await expect(workerPool.closeSession(session.sessionId)).resolves.toMatchObject({ ok: true });
+
+      expect(docSubsStore.getDocSubscription(dataDir, 'app-doc-thread-close', fileToken)).toMatchObject({
+        sessionAnchor: watchAnchor,
+        managedBy: 'watch-comment',
+      });
+      expect(unsubscribe).not.toHaveBeenCalled();
+    } finally {
       config.session.dataDir = previousDataDir;
     }
   });
@@ -175,7 +230,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(markerPath)).toBe(true);
 
       worker.emit('exit');
-      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false, known: true });
+      await expect(pending).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
       expect(existsSync(markerPath)).toBe(false);
     } finally {
       config.session.dataDir = previousDataDir;

@@ -8,6 +8,8 @@
  * response. Behaviour is byte-equivalent to the original inline implementation;
  * all IO flows through `deps`.
  */
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+
 
 export interface DaemonHandle {
   larkAppId: string;
@@ -68,7 +70,7 @@ export async function addBotsToGroup(
   } catch {
     return err('bad_json', 400);
   }
-  const fetchFn = deps.fetch ?? fetch;
+  const fetchFn = deps.fetch ?? loopbackFetchImpl;
   let proxy: DaemonHandle | undefined;
   for (const d of deps.registryList()) {
     try {
@@ -140,7 +142,7 @@ export async function leaveGroup(
     : [];
   if (ids.length === 0) return err('larkAppIds_required', 400);
 
-  const fetchFn = deps.fetch ?? fetch;
+  const fetchFn = deps.fetch ?? loopbackFetchImpl;
   const result = await Promise.all(ids.map(async appId => {
     const d = deps.registryGetByAppId(appId);
     // Pre-proxy failure shapes do NOT carry `closedSessions` — matches the
@@ -194,6 +196,30 @@ export async function bindOncall(
 }
 
 /**
+ * PUT /api/groups/:chatId/name/:appId — rename a group through one explicit
+ * bot identity. The selected daemon validates membership and the Lark name.
+ */
+export async function renameGroup(
+  chatId: string,
+  appId: string,
+  bodyRaw: string,
+  deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(
+    appId,
+    `/api/groups/${encodeURIComponent(chatId)}/name`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: bodyRaw || '{}',
+    },
+  );
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/**
  * DELETE /api/groups/:chatId/oncall/:appId — unbind the per-(chat × bot)
  * oncall. Internal proxy path is `/api/oncall/:chatId` DELETE.
  */
@@ -204,6 +230,44 @@ export async function unbindOncall(
 ): Promise<HandlerResult> {
   const upstream = await deps.proxyToDaemon(
     appId, `/api/oncall/${encodeURIComponent(chatId)}`, { method: 'DELETE' },
+  );
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist the new-topic defaults on the named group member bot. */
+export async function setDefaultModelsForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-default-models/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/**
+ * PUT /api/groups/:chatId/pin-streaming-card/:appId — set the per-(chat × bot)
+ * pin-streaming-card override. Internal proxy path is
+ * `/api/chat-pin-streaming-card/:chatId` PUT on the named bot's daemon.
+ * Body (`{ enabled: boolean }`) is forwarded verbatim.
+ */
+export async function setPinStreamingCardForGroup(
+  chatId: string,
+  appId: string,
+  bodyRaw: string,
+  deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(
+    appId,
+    `/api/chat-pin-streaming-card/${encodeURIComponent(chatId)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: bodyRaw || '{}',
+    },
   );
   const { text, json } = await parseUpstream(upstream);
   if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
