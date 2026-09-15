@@ -1,0 +1,23 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "botmux.fullname" . }}
+  labels:
+    {{- include "botmux.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.ingress.gatewayName }}
+      namespace: {{ .Values.ingress.gatewayNamespace }}
+      sectionName: {{ .Values.ingress.gatewaySectionName }}
+  hostnames:
+    - {{ .Values.ingress.host | quote }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "botmux.fullname" . }}
+          port: {{ .Values.service.dashboardPort }}
+{{- end }}

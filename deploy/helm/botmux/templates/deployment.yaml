@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "botmux.fullname" . }}
+  labels:
+    {{- include "botmux.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "botmux.fullname" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "botmux.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "botmux.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "botmux.serviceAccountName" . }}
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      initContainers:
+        - name: configure-lark-cli
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - >-
+              if [ -n "${LARK_CLI_APP_ID}" ] && [ -n "${LARK_CLI_APP_SECRET}" ]; then
+                printf '%s' "${LARK_CLI_APP_SECRET}" | lark-cli config init
+                --app-id "${LARK_CLI_APP_ID}" --app-secret-stdin
+                --brand "${LARK_CLI_BRAND}";
+              fi
+          envFrom:
+            - secretRef:
+                name: {{ include "botmux.credentialsSecretName" . }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+      containers:
+        - name: daemon
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/botmux", "__daemon"]
+          env:
+            - name: HOME
+              value: /home/node
+            - name: BOTS_CONFIG
+              value: /home/node/.botmux/bots.json
+            - name: WORKING_DIR
+              value: /home/node
+            - name: SESSION_DATA_DIR
+              value: /home/node/.botmux/data
+            - name: BOTMUX_BOT_INDEX
+              value: {{ .Values.botIndex | quote }}
+            - name: BKECTL_AUTH_MODE
+              value: app_only
+            - name: BYTECLOUD_AUTH_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_ACCESS_KEY_ID
+            - name: BYTECLOUD_AUTH_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_SECRET_ACCESS_KEY
+          envFrom:
+            - secretRef:
+                name: {{ include "botmux.credentialsSecretName" . }}
+          ports:
+            - name: terminal
+              containerPort: 8800
+          readinessProbe:
+            tcpSocket:
+              port: terminal
+            initialDelaySeconds: 15
+          livenessProbe:
+            tcpSocket:
+              port: terminal
+            initialDelaySeconds: 60
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+        - name: dashboard
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/botmux", "__dashboard"]
+          env:
+            - name: HOME
+              value: /home/node
+            - name: WORKING_DIR
+              value: /home/node
+            - name: SESSION_DATA_DIR
+              value: /home/node/.botmux/data
+          ports:
+            - name: dashboard
+              containerPort: 7891
+          readinessProbe:
+            tcpSocket:
+              port: dashboard
+            initialDelaySeconds: 15
+          livenessProbe:
+            tcpSocket:
+              port: dashboard
+            initialDelaySeconds: 60
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: {{ include "botmux.fullname" . }}-home
