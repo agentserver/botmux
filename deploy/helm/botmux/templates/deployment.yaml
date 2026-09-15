@@ -31,6 +31,11 @@ spec:
           args:
             - |
               set -eu
+              mkdir -p /home/node/.codex
+              if [ ! -e /home/node/.codex/config.toml ]; then
+                cp /config/config.toml /home/node/.codex/config.toml
+                chmod 600 /home/node/.codex/config.toml
+              fi
               marker=/home/node/.botmux-initialized
               if [ -f "$marker" ]; then exit 0; fi
               botmux setup add --app-id "$LARK_CLI_APP_ID" --app-secret "$LARK_CLI_APP_SECRET" \
@@ -50,6 +55,8 @@ spec:
           volumeMounts:
             - name: home
               mountPath: /home/node
+            - name: codex-config
+              mountPath: /config
         - name: configure-lark-cli
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -147,3 +154,6 @@ spec:
         - name: home
           persistentVolumeClaim:
             claimName: {{ include "botmux.fullname" . }}-home
+        - name: codex-config
+          configMap:
+            name: {{ include "botmux.fullname" . }}-codex-config
