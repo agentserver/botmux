@@ -31,7 +31,7 @@ spec:
           args:
             - |
               set -eu
-              marker=/home/node/.botmux/.botmux-setup-initialized
+              marker=/home/node/.botmux-initialized
               if [ -f "$marker" ]; then exit 0; fi
               botmux setup add --app-id "$LARK_CLI_APP_ID" --app-secret "$LARK_CLI_APP_SECRET" \
                 --allowed-users "$BOTMUX_ALLOWED_USERS" --cli "$BOTMUX_SETUP_CLI" \
