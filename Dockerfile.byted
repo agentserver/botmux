@@ -27,7 +27,7 @@ RUN set -eu; \
 RUN set -eu; \
     mkdir -p /opt/bkectl; \
     cd /opt/bkectl; \
-    bvc clone sre/tce/srectl --version "${BKECTL_VERSION}"; \
+    IP_TYPE=ipv4 bvc clone sre/tce/srectl --version "${BKECTL_VERSION}"; \
     install -m 0755 /opt/bkectl/srectl/bkectl /usr/local/bin/bkectl; \
     rm -rf /opt/bkectl
 
