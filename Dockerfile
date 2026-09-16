@@ -8,7 +8,7 @@ FROM node:trixie-slim
 # - git/curl/ca-certificates: project work and HTTPS
 # - canvas libraries/fonts: terminal screenshots
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux git curl ca-certificates sudo vim zsh \
+    tmux git curl ca-certificates sudo vim zsh iproute2 iputils-ping \
     libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
     libgif7 libjpeg62-turbo librsvg2-2 \
     fonts-noto-cjk fonts-noto-color-emoji \
