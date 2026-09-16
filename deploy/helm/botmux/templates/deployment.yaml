@@ -109,6 +109,13 @@ spec:
               value: /home/node/.botmux/data
             - name: BOTMUX_BOT_INDEX
               value: {{ .Values.botIndex | quote }}
+            {{- if .Values.web.publicUrl }}
+            - name: BOTMUX_PUBLIC_URL
+              value: {{ .Values.web.publicUrl | trimSuffix "/" | quote }}
+            {{- else if and .Values.ingress.enabled .Values.ingress.host }}
+            - name: BOTMUX_PUBLIC_URL
+              value: {{ printf "https://%s" .Values.ingress.host | quote }}
+            {{- end }}
             - name: BKECTL_AUTH_MODE
               value: app_only
             - name: BYTECLOUD_AUTH_ACCESS_KEY_ID

@@ -16,6 +16,12 @@ service:
   dashboardPort: 7891
   terminalPort: 8800
 
+# Public URL used in Feishu Web terminal buttons. When empty, an enabled
+# HTTPS ingress derives https://<ingress.host>; set this explicitly when the
+# external URL is provided by another reverse proxy or uses a non-HTTPS scheme.
+web:
+  publicUrl: ""
+
 ingress:
   enabled: false
   host: ""
