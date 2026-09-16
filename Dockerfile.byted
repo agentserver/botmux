@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 
 USER root
 ARG TARGETARCH
+ARG BKECTL_VERSION=1.0.0.885
 ARG BYTEDCLI_VERSION=latest
 ARG LARK_CLI_VERSION=latest
 
@@ -26,7 +27,7 @@ RUN set -eu; \
 RUN set -eu; \
     mkdir -p /opt/bkectl; \
     cd /opt/bkectl; \
-    bvc clone sre/tce/srectl; \
+    bvc clone sre/tce/srectl --version "${BKECTL_VERSION}"; \
     install -m 0755 /opt/bkectl/srectl/bkectl /usr/local/bin/bkectl; \
     rm -rf /opt/bkectl
 
