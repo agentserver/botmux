@@ -24,6 +24,7 @@ RUN set -eu; \
     install -m 0755 /opt/bvc/bin/bvc /usr/local/bin/bvc
 
 RUN set -eu; \
+    printf '%s\n' 'precedence ::ffff:0:0/96 100' >> /etc/gai.conf; \
     mkdir -p /opt/bkectl; \
     cd /opt/bkectl; \
     bvc clone sre/tce/srectl; \
