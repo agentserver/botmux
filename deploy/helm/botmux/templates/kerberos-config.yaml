@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "botmux.fullname" . }}-kerberos
+  labels:
+    {{- include "botmux.labels" . | nindent 4 }}
+data:
+  krb5.conf: |
+    [libdefaults]
+      default_realm = BYTEDANCE.COM
+      dns_canonicalize_hostname = false
+      dns_lookup_realm = false
+      dns_lookup_kdc = false
+      rdns = false
+      forwardable = true
+      proxiable = true
+    [realms]
+      BYTEDANCE.COM = {
+        kdc = krb5auth1.byted.org
+        kdc = krb5auth2.byted.org
+        kdc = krb5auth3.byted.org
+        kdc = krb5auth.byted.org
+      }
+    [domain_realm]
+      .byted.org = BYTEDANCE.COM
+      byted.org = BYTEDANCE.COM
+  ssh.conf: |
+    Host code.byted.org *.byted.org
+      GSSAPIAuthentication yes
+      GSSAPIDelegateCredentials no
