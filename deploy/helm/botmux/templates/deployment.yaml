@@ -104,6 +104,8 @@ spec:
           env:
             - name: HOME
               value: /home/node
+            - name: SHELL
+              value: /bin/bash
             - name: BOTS_CONFIG
               value: /home/node/.botmux/bots.json
             - name: WORKING_DIR
