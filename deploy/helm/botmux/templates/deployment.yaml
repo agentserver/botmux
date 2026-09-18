@@ -119,7 +119,7 @@ spec:
             - name: KRB5_CONFIG
               value: /etc/krb5.conf
             - name: KRB5_KTNAME
-              value: FILE:/home/node/.krb5/service.keytab
+              value: FILE:/etc/krb5.keytab
             {{- if .Values.kerberos.principal }}
             - name: KRB5_PRINCIPAL
               value: {{ .Values.kerberos.principal | quote }}
@@ -177,6 +177,10 @@ spec:
             - name: kerberos-config
               mountPath: /etc/ssh/ssh_config.d/99-botmux-gssapi.conf
               subPath: ssh.conf
+              readOnly: true
+            - name: home
+              mountPath: /etc/krb5.keytab
+              subPath: .krb5/service.keytab
               readOnly: true
         - name: dashboard
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
