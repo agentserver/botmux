@@ -22,10 +22,6 @@ service:
 web:
   publicUrl: ""
 
-kerberos:
-  # Optional principal matching the mounted /home/node/.krb5/service.keytab.
-  principal: ""
-
 ingress:
   enabled: false
   host: ""

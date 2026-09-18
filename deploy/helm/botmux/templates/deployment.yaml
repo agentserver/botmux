@@ -38,16 +38,7 @@ spec:
               if [ ! -e /home/node/.zshrc ]; then printf '%s\n' '# botmux container shell defaults' > /home/node/.zshrc; fi;
               chown 1000:1000 /home/node/.zshrc;
               chmod 600 /home/node/.zshrc;
-              if [ ! -e /home/node/.bashrc ]; then printf '%s\n' '# botmux container shell defaults' > /home/node/.bashrc; fi;
-              if ! grep -q 'botmux kerberos init' /home/node/.bashrc; then
-                printf '%s\n' \
-                  '# botmux kerberos init' \
-                  'if [ -n "${KRB5_PRINCIPAL:-}" ] && [ -n "${KRB5_KTNAME:-}" ] && [ -r "${KRB5_KTNAME#FILE:}" ] && command -v klist >/dev/null 2>&1 && ! klist -s 2>/dev/null; then' \
-                  '  kinit -k -t "${KRB5_KTNAME#FILE:}" "$KRB5_PRINCIPAL" >/dev/null 2>&1 || true' \
-                  'fi' >> /home/node/.bashrc;
-              fi;
-              chown 1000:1000 /home/node/.bashrc;
-              chmod 600 /home/node/.bashrc
+              if [ -f /home/node/.bashrc ]; then sed -i '/^# botmux kerberos init$/,/^fi$/d' /home/node/.bashrc; chown 1000:1000 /home/node/.bashrc; chmod 600 /home/node/.bashrc; fi
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -118,12 +109,6 @@ spec:
               value: /bin/bash
             - name: KRB5_CONFIG
               value: /etc/krb5.conf
-            - name: KRB5_KTNAME
-              value: FILE:/etc/krb5.keytab
-            {{- if .Values.kerberos.principal }}
-            - name: KRB5_PRINCIPAL
-              value: {{ .Values.kerberos.principal | quote }}
-            {{- end }}
             - name: BOTS_CONFIG
               value: /home/node/.botmux/bots.json
             - name: WORKING_DIR
