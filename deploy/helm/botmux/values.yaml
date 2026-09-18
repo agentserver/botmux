@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: aliyun-sin-hub.byted.org/agentserver/botmux
-  tag: 3.23.0-byted.8
+  tag: 3.23.1-byted.1
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 botIndex: "0"
