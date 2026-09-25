@@ -28,6 +28,13 @@ RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/usr/local/share/codex CODEX_NON
     chown -R node:node /usr/local/share/codex /usr/local/bin/codex /usr/local/bin/codex-code-mode-host; \
     codex --version
 
+ARG DSH_VERSION=0.1.7-rc.2
+RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" \
+    && mkdir -p /home/node/.dsh \
+    && chown -R node:node /home/node/.dsh \
+    && DSH_HOME=/home/node/.dsh dsh --version \
+    && npm cache clean --force
+
 WORKDIR /home/node
 
 # App home and default CLI working directory.
@@ -40,9 +47,12 @@ ENV NODE_ENV=production
 ENV SESSION_DATA_DIR=/home/node/.botmux/data
 ENV HOME=/home/node
 ENV WORKING_DIR=/home/node
+ENV DSH_HOME=/home/node/.dsh
 
 # 用最终的非 root 身份校验二进制。
-RUN command -v botmux && botmux --version && command -v codex && codex --version
+RUN command -v botmux && botmux --version \
+    && command -v codex && codex --version \
+    && command -v dsh && dsh --version
 
 # Dashboard & web terminal proxy ports
 EXPOSE 7891 8800
