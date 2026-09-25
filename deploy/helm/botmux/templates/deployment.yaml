@@ -38,7 +38,8 @@ spec:
               if [ ! -e /home/node/.zshrc ]; then printf '%s\n' '# botmux container shell defaults' > /home/node/.zshrc; fi;
               chown 1000:1000 /home/node/.zshrc;
               chmod 600 /home/node/.zshrc;
-              if [ -f /home/node/.bashrc ]; then sed -i '/^# botmux kerberos init$/,/^fi$/d' /home/node/.bashrc; chown 1000:1000 /home/node/.bashrc; chmod 600 /home/node/.bashrc; fi
+              if [ -f /home/node/.bashrc ]; then sed -i '/^# botmux kerberos init$/,/^fi$/d' /home/node/.bashrc; chown 1000:1000 /home/node/.bashrc; chmod 600 /home/node/.bashrc; fi;
+              if [ -f /home/node/.dsh/.credentials.yaml ]; then chown 1000:1000 /home/node/.dsh/.credentials.yaml; chmod 600 /home/node/.dsh/.credentials.yaml; fi
           securityContext:
             runAsUser: 0
             runAsGroup: 0
