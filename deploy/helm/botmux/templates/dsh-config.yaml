@@ -1,0 +1,19 @@
+{{- if .Values.dsh.web.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "botmux.fullname" . }}-dsh-config
+  labels:
+    {{- include "botmux.labels" . | nindent 4 }}
+data:
+  cordis.patch.yml: |
+    - id: llm-pi-ai
+      config:
+        providers:
+          openai:
+            apiKeyEnv: OPENAI_API_KEY
+            api: openai-responses
+            baseURL: {{ .Values.codex.provider.baseUrl | quote }}
+            models:
+              - id: {{ .Values.codex.model | quote }}
+{{- end }}

@@ -98,6 +98,26 @@ spec:
           volumeMounts:
             - name: home
               mountPath: /home/node
+        {{- if .Values.dsh.web.enabled }}
+        - name: configure-dsh
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /home/node/.dsh/profiles/web
+              if [ ! -e /home/node/.dsh/profiles/web/cordis.patch.yml ] || grep -q '^\[\]$' /home/node/.dsh/profiles/web/cordis.patch.yml; then
+                cp /dsh-config/cordis.patch.yml /home/node/.dsh/profiles/web/cordis.patch.yml
+                chmod 600 /home/node/.dsh/profiles/web/cordis.patch.yml
+              fi
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+            - name: dsh-config
+              mountPath: /dsh-config
+              readOnly: true
+        {{- end }}
       containers:
         - name: daemon
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -208,6 +228,9 @@ spec:
               value: /home/node/.dsh
             - name: DSH_WEB_PORT
               value: {{ .Values.dsh.web.port | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ include "botmux.credentialsSecretName" . }}
           ports:
             - name: dsh-web
               containerPort: {{ .Values.dsh.web.port }}
@@ -235,3 +258,8 @@ spec:
         - name: kerberos-config
           configMap:
             name: {{ include "botmux.fullname" . }}-kerberos
+        {{- if .Values.dsh.web.enabled }}
+        - name: dsh-config
+          configMap:
+            name: {{ include "botmux.fullname" . }}-dsh-config
+        {{- end }}
