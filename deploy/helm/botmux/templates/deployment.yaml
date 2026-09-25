@@ -213,11 +213,11 @@ spec:
               containerPort: {{ .Values.dsh.web.port }}
           readinessProbe:
             exec:
-              command: ["sh", "-c", "curl -fsS http://127.0.0.1:${DSH_WEB_PORT}/ >/dev/null"]
+              command: ["sh", "-c", "code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:${DSH_WEB_PORT}/) && test \"$code\" != 000"]
             initialDelaySeconds: 10
           livenessProbe:
             exec:
-              command: ["sh", "-c", "curl -fsS http://127.0.0.1:${DSH_WEB_PORT}/ >/dev/null"]
+              command: ["sh", "-c", "code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:${DSH_WEB_PORT}/) && test \"$code\" != 000"]
             initialDelaySeconds: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
