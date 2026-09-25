@@ -205,16 +205,18 @@ spec:
               value: /home/node
             - name: DSH_HOME
               value: /home/node/.dsh
+            - name: DSH_WEB_PORT
+              value: {{ .Values.dsh.web.port | quote }}
           ports:
             - name: dsh-web
               containerPort: {{ .Values.dsh.web.port }}
           readinessProbe:
-            tcpSocket:
-              port: dsh-web
+            exec:
+              command: ["sh", "-c", "curl -fsS http://127.0.0.1:${DSH_WEB_PORT}/ >/dev/null"]
             initialDelaySeconds: 10
           livenessProbe:
-            tcpSocket:
-              port: dsh-web
+            exec:
+              command: ["sh", "-c", "curl -fsS http://127.0.0.1:${DSH_WEB_PORT}/ >/dev/null"]
             initialDelaySeconds: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
