@@ -16,3 +16,8 @@ spec:
     - name: terminal
       port: {{ .Values.service.terminalPort }}
       targetPort: terminal
+    {{- if .Values.dsh.web.enabled }}
+    - name: dsh-web
+      port: {{ .Values.dsh.web.port }}
+      targetPort: dsh-web
+    {{- end }}

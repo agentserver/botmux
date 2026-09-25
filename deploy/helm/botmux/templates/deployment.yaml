@@ -194,6 +194,34 @@ spec:
           volumeMounts:
             - name: home
               mountPath: /home/node
+        {{- if .Values.dsh.web.enabled }}
+        - name: dsh-web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/dsh"]
+          args: ["web", "--no-open", "--port", {{ .Values.dsh.web.port | quote }}]
+          env:
+            - name: HOME
+              value: /home/node
+            - name: DSH_HOME
+              value: /home/node/.dsh
+          ports:
+            - name: dsh-web
+              containerPort: {{ .Values.dsh.web.port }}
+          readinessProbe:
+            tcpSocket:
+              port: dsh-web
+            initialDelaySeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: dsh-web
+            initialDelaySeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/node
+        {{- end }}
       volumes:
         - name: home
           persistentVolumeClaim:
