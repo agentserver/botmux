@@ -106,7 +106,7 @@ spec:
           args:
             - |
               set -eu
-              mkdir -p /home/node/.dsh /home/node/.dsh/profiles/web
+              mkdir -p /home/node/.dsh /home/node/.dsh/profiles/web /home/node/.dsh/profiles/botmux
               if [ ! -e /home/node/.dsh/settings.yaml ]; then
                 cp /dsh-config/settings.yaml /home/node/.dsh/settings.yaml
                 chmod 600 /home/node/.dsh/settings.yaml
@@ -117,6 +117,13 @@ spec:
               elif ! grep -q '^[[:space:]]*- id: agent-default-model$' /home/node/.dsh/profiles/web/cordis.patch.yml; then
                 cat /dsh-config/agent-default.patch.yml >> /home/node/.dsh/profiles/web/cordis.patch.yml
                 chmod 600 /home/node/.dsh/profiles/web/cordis.patch.yml
+              fi
+              if [ ! -e /home/node/.dsh/profiles/botmux/cordis.patch.yml ]; then
+                cp /dsh-config/cordis.patch.yml /home/node/.dsh/profiles/botmux/cordis.patch.yml
+                chmod 600 /home/node/.dsh/profiles/botmux/cordis.patch.yml
+              elif ! grep -q '^[[:space:]]*- id: llm-pi-ai$' /home/node/.dsh/profiles/botmux/cordis.patch.yml; then
+                cat /dsh-config/cordis.patch.yml >> /home/node/.dsh/profiles/botmux/cordis.patch.yml
+                chmod 600 /home/node/.dsh/profiles/botmux/cordis.patch.yml
               fi
           volumeMounts:
             - name: home
