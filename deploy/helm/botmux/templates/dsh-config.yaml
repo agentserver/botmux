@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "botmux.labels" . | nindent 4 }}
 data:
+  settings.yaml: |
+    agent-default-model:
+      provider: openai
+      model: {{ .Values.codex.model | quote }}
   cordis.patch.yml: |
     - id: llm-pi-ai
       config:

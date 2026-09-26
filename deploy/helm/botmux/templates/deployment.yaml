@@ -106,7 +106,11 @@ spec:
           args:
             - |
               set -eu
-              mkdir -p /home/node/.dsh/profiles/web
+              mkdir -p /home/node/.dsh /home/node/.dsh/profiles/web
+              if [ ! -e /home/node/.dsh/settings.yaml ]; then
+                cp /dsh-config/settings.yaml /home/node/.dsh/settings.yaml
+                chmod 600 /home/node/.dsh/settings.yaml
+              fi
               if [ ! -e /home/node/.dsh/profiles/web/cordis.patch.yml ] || grep -q '^\[\]$' /home/node/.dsh/profiles/web/cordis.patch.yml; then
                 cp /dsh-config/cordis.patch.yml /home/node/.dsh/profiles/web/cordis.patch.yml
                 chmod 600 /home/node/.dsh/profiles/web/cordis.patch.yml
