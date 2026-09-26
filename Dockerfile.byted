@@ -42,4 +42,5 @@ USER node
 RUN --network=none command -v bkectl && BKECTL_DISABLE_AUTO_UPDATE=1 bkectl version \
     && command -v bytedcli && bytedcli --version \
     && command -v lark-cli && lark-cli --version \
-    && command -v dsh && dsh --version
+    && command -v dsh && dsh --version \
+    && command -v pnpm && pnpm --version

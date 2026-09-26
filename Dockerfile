@@ -29,10 +29,12 @@ RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/usr/local/share/codex CODEX_NON
     codex --version
 
 ARG DSH_VERSION=0.1.7-rc.2
-RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" \
+ARG PNPM_VERSION=11.7.0
+RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && mkdir -p /home/node/.dsh \
     && chown -R node:node /home/node/.dsh \
     && DSH_HOME=/home/node/.dsh dsh --version \
+    && pnpm --version \
     && npm cache clean --force
 
 WORKDIR /home/node
@@ -52,7 +54,8 @@ ENV DSH_HOME=/home/node/.dsh
 # 用最终的非 root 身份校验二进制。
 RUN command -v botmux && botmux --version \
     && command -v codex && codex --version \
-    && command -v dsh && dsh --version
+    && command -v dsh && dsh --version \
+    && command -v pnpm && pnpm --version
 
 # Dashboard & web terminal proxy ports
 EXPOSE 7891 8800
