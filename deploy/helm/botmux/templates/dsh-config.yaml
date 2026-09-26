@@ -29,7 +29,4 @@ data:
       config:
         provider: openai
         model: {{ .Values.codex.model | quote }}
-  botmux-disable-web-fetch.patch.yml: |
-    - id: web-fetch-http
-      disabled: true
 {{- end }}
