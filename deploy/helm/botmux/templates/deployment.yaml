@@ -226,8 +226,20 @@ spec:
         - name: dsh-web
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/usr/local/bin/dsh"]
-          args: ["web", "--no-open", "--port", {{ .Values.dsh.web.port | quote }}]
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              /usr/local/bin/dsh web --no-open --port "$DSH_WEB_PORT" &
+              pid=$!
+              while kill -0 "$pid" 2>/dev/null; do
+                if [ ! -e "$DSH_HOME/settings.yaml" ] && [ -e "$DSH_HOME/settings.yaml.imported" ]; then
+                  cp "$DSH_HOME/settings.yaml.imported" "$DSH_HOME/settings.yaml"
+                  chmod 600 "$DSH_HOME/settings.yaml"
+                fi
+                sleep 1
+              done
+              wait "$pid"
           env:
             - name: HOME
               value: /home/node
