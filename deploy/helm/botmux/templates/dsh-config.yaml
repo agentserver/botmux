@@ -16,4 +16,13 @@ data:
             baseURL: {{ .Values.codex.provider.baseUrl | quote }}
             models:
               - id: {{ .Values.codex.model | quote }}
+    - id: agent-default-model
+      config:
+        provider: openai
+        model: {{ .Values.codex.model | quote }}
+  agent-default.patch.yml: |
+    - id: agent-default-model
+      config:
+        provider: openai
+        model: {{ .Values.codex.model | quote }}
 {{- end }}

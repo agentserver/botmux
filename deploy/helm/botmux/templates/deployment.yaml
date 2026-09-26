@@ -110,6 +110,9 @@ spec:
               if [ ! -e /home/node/.dsh/profiles/web/cordis.patch.yml ] || grep -q '^\[\]$' /home/node/.dsh/profiles/web/cordis.patch.yml; then
                 cp /dsh-config/cordis.patch.yml /home/node/.dsh/profiles/web/cordis.patch.yml
                 chmod 600 /home/node/.dsh/profiles/web/cordis.patch.yml
+              elif ! grep -q '^[[:space:]]*- id: agent-default-model$' /home/node/.dsh/profiles/web/cordis.patch.yml; then
+                cat /dsh-config/agent-default.patch.yml >> /home/node/.dsh/profiles/web/cordis.patch.yml
+                chmod 600 /home/node/.dsh/profiles/web/cordis.patch.yml
               fi
           volumeMounts:
             - name: home
