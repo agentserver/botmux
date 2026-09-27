@@ -33,6 +33,8 @@ jobs:
     # 暴露刚推送镜像的 manifest digest，供下游 bkectl 镜像按不可变引用消费
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+      labels: ${{ steps.meta.outputs.labels }}
 
     steps:
       - uses: actions/checkout@v6
@@ -116,23 +118,6 @@ jobs:
           username: ${{ secrets.ICM_USERNAME }}
           password: ${{ secrets.ICM_PASSWORD }}
 
-      - name: Generate Docker metadata (tags / labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          # 内网 registry host 来自 vars.ICM_REGISTRY，仓库路径 agentserver/botmux
-          images: ${{ vars.ICM_REGISTRY }}/agentserver/botmux
-          # 与 base 镜像同一套 tag 规则（master / semver / sha），latest=auto
-          flavor: |
-            latest=auto
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
-            type=sha,prefix=sha-
-
       - name: Build and push byted image
         id: build
         uses: docker/build-push-action@v6
@@ -145,7 +130,7 @@ jobs:
           # 以上一个 job 推送镜像的 manifest digest 作为 base——不可变、跟本次构建一一对应
           build-args: |
             BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ vars.ICM_REGISTRY }}/agentserver/botmux:${{ needs.build-and-push.outputs.version }}
+          labels: ${{ needs.build-and-push.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
