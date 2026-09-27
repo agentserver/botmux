@@ -278,6 +278,18 @@ spec:
               value: /home/node/.dsh
             - name: DSH_WEB_PORT
               value: {{ .Values.dsh.web.port | quote }}
+            - name: BKECTL_AUTH_MODE
+              value: app_only
+            - name: BYTECLOUD_AUTH_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_ACCESS_KEY_ID
+            - name: BYTECLOUD_AUTH_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_SECRET_ACCESS_KEY
           envFrom:
             - secretRef:
                 name: {{ include "botmux.credentialsSecretName" . }}
