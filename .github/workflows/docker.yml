@@ -35,6 +35,8 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.meta.outputs.version }}
       labels: ${{ steps.meta.outputs.labels }}
+      byted-tags: ${{ steps.byted-meta.outputs.tags }}
+      byted-labels: ${{ steps.byted-meta.outputs.labels }}
 
     steps:
       - uses: actions/checkout@v6
@@ -71,6 +73,21 @@ jobs:
             # workflow_dispatch 自定义 tag
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
             # 兜底：commit SHA → :sha-<short-sha>
+            type=sha,prefix=sha-
+
+      - name: Generate byted Docker metadata (tags / labels)
+        id: byted-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ICM_REGISTRY }}/agentserver/botmux
+          flavor: |
+            latest=auto
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
@@ -129,7 +146,7 @@ jobs:
           push: true
           build-args: |
             BASE_IMAGE=${{ vars.ICM_REGISTRY }}/agentserver/botmux:3.30.0-byted.2
-          tags: ${{ vars.ICM_REGISTRY }}/agentserver/botmux:${{ needs.build-and-push.outputs.version }}
-          labels: ${{ needs.build-and-push.outputs.labels }}
+          tags: ${{ needs.build-and-push.outputs.byted-tags }}
+          labels: ${{ needs.build-and-push.outputs.byted-labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
