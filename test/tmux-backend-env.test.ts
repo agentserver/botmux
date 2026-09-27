@@ -90,6 +90,18 @@ describe('buildBotmuxEnvAssignments() — CA bundle', () => {
 });
 
 describe('buildBotmuxEnvAssignments()', () => {
+  it('forwards ByteCloud app-only credentials per pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      BKECTL_AUTH_MODE: 'app_only',
+      BYTECLOUD_AUTH_ACCESS_KEY_ID: 'ak',
+      BYTECLOUD_AUTH_SECRET_ACCESS_KEY: 'sk',
+    });
+    expect(out).toEqual(expect.arrayContaining([
+      'BKECTL_AUTH_MODE=app_only',
+      'BYTECLOUD_AUTH_ACCESS_KEY_ID=ak',
+      'BYTECLOUD_AUTH_SECRET_ACCESS_KEY=sk',
+    ]));
+  });
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({
       // Bare creds must never reach the child — the worker redacts them

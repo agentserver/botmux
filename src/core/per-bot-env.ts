@@ -87,6 +87,9 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'DSH_HOME',
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  'BKECTL_AUTH_MODE',
+  'BYTECLOUD_AUTH_ACCESS_KEY_ID',
+  'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
 ]);
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */

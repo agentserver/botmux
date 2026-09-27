@@ -261,6 +261,17 @@ export const REDACTED_CHILD_ENV_KEYS = [
 ] as const;
 
 /**
+ * ByteCloud app-only credentials needed by bkectl in a bot session. They are
+ * forwarded per pane and stripped from the tmux client/server environment so
+ * one bot's application identity cannot leak into another pane.
+ */
+export const BYTECLOUD_APP_AUTH_ENV_KEYS = [
+  'BKECTL_AUTH_MODE',
+  'BYTECLOUD_AUTH_ACCESS_KEY_ID',
+  'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
+] as const;
+
+/**
  * Session-level CLI data-root pointers: claude-family → CLAUDE_CONFIG_DIR,
  * codex → CODEX_HOME. Botmux computes these PER SESSION (read isolation pins
  * `<BOT_HOME>/claude|codex`; Seed/Relay pin their fork dirs via adapter
@@ -344,6 +355,7 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
  * into its global env either.
  */
 export const BOTMUX_INJECTED_ENV_KEYS = [
+  ...BYTECLOUD_APP_AUTH_ENV_KEYS,
   '__OWNER_OPEN_ID',
   'BOTMUX',
   'SESSION_DATA_DIR',
