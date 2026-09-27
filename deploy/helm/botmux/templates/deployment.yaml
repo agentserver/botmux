@@ -59,12 +59,41 @@ spec:
                 chmod 600 /home/node/.codex/config.toml
               fi
               marker=/home/node/.botmux-initialized
-              if [ -f "$marker" ]; then exit 0; fi
-              botmux setup add --app-id "$LARK_CLI_APP_ID" --app-secret "$LARK_CLI_APP_SECRET" \
-                --allowed-users "$BOTMUX_ALLOWED_USERS" --cli "$BOTMUX_SETUP_CLI" \
-                --working-dir "$BOTMUX_SETUP_WORKING_DIR" {{ if .Values.setup.openPlatformAuto }}--open-platform-auto{{ else }}--no-open-platform-auto{{ end }} --json
-              touch "$marker"
+              if [ ! -f "$marker" ]; then
+                botmux setup add --app-id "$LARK_CLI_APP_ID" --app-secret "$LARK_CLI_APP_SECRET" \
+                  --allowed-users "$BOTMUX_ALLOWED_USERS" --cli "$BOTMUX_SETUP_CLI" \
+                  --working-dir "$BOTMUX_SETUP_WORKING_DIR" {{ if .Values.setup.openPlatformAuto }}--open-platform-auto{{ else }}--no-open-platform-auto{{ end }} --json
+                touch "$marker"
+              fi
+              node <<'NODE'
+              const fs = require('fs');
+              const path = '/home/node/.botmux/bots.json';
+              const appId = process.env.LARK_CLI_APP_ID;
+              const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+              const bots = Array.isArray(data) ? data : data.bots;
+              if (!Array.isArray(bots)) throw new Error('bots.json must contain an array');
+              for (const bot of bots) {
+                if (appId && bot.larkAppId !== appId) continue;
+                bot.env = {
+                  ...(bot.env && typeof bot.env === 'object' && !Array.isArray(bot.env) ? bot.env : {}),
+                  BKECTL_AUTH_MODE: 'app_only',
+                  BYTECLOUD_AUTH_ACCESS_KEY_ID: process.env.BKECTL_ACCESS_KEY_ID,
+                  BYTECLOUD_AUTH_SECRET_ACCESS_KEY: process.env.BKECTL_SECRET_ACCESS_KEY,
+                };
+              }
+              fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+              NODE
           env:
+            - name: BKECTL_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_ACCESS_KEY_ID
+            - name: BKECTL_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "botmux.credentialsSecretName" . }}
+                  key: BKECTL_SECRET_ACCESS_KEY
             - name: BOTMUX_ALLOWED_USERS
               value: {{ required "values.setup.allowedUsers must contain at least one owner" (join "," .Values.setup.allowedUsers) | quote }}
             - name: BOTMUX_SETUP_CLI
