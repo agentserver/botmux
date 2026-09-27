@@ -54,6 +54,14 @@ spec:
             - |
               set -eu
               mkdir -p /home/node/.codex
+              mkdir -p /home/node/.botmux/bin
+              cat > /home/node/.botmux/bin/bkectl <<'EOF'
+              #!/bin/sh
+              if [ -n "${BYTECLOUD_A:-}" ]; then export BYTECLOUD_AUTH_ACCESS_KEY_ID="$BYTECLOUD_A"; fi
+              if [ -n "${BYTECLOUD_S:-}" ]; then export BYTECLOUD_AUTH_SECRET_ACCESS_KEY="$BYTECLOUD_S"; fi
+              exec /usr/local/bin/bkectl "$@"
+              EOF
+              chmod 700 /home/node/.botmux/bin/bkectl
               if [ ! -e /home/node/.codex/config.toml ]; then
                 cp /config/config.toml /home/node/.codex/config.toml
                 chmod 600 /home/node/.codex/config.toml
@@ -74,12 +82,15 @@ spec:
               if (!Array.isArray(bots)) throw new Error('bots.json must contain an array');
               for (const bot of bots) {
                 if (appId && bot.larkAppId !== appId) continue;
-                bot.env = {
+                const env = {
                   ...(bot.env && typeof bot.env === 'object' && !Array.isArray(bot.env) ? bot.env : {}),
                   BKECTL_AUTH_MODE: 'app_only',
-                  BYTECLOUD_AUTH_ACCESS_KEY_ID: process.env.BKECTL_ACCESS_KEY_ID,
-                  BYTECLOUD_AUTH_SECRET_ACCESS_KEY: process.env.BKECTL_SECRET_ACCESS_KEY,
+                  BYTECLOUD_A: process.env.BKECTL_ACCESS_KEY_ID,
+                  BYTECLOUD_S: process.env.BKECTL_SECRET_ACCESS_KEY,
                 };
+                delete env.BYTECLOUD_AUTH_ACCESS_KEY_ID;
+                delete env.BYTECLOUD_AUTH_SECRET_ACCESS_KEY;
+                bot.env = env;
               }
               fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
               NODE
