@@ -127,9 +127,10 @@ jobs:
           # BVC 当前发布包仅支持 amd64，与 k8s-sg runner 一致。
           platforms: linux/amd64
           push: true
-          # 以上一个 job 推送镜像的 manifest digest 作为 base——不可变、跟本次构建一一对应
+          # 通过内网 GHCR 代理拉取上一个 job 推送的 manifest digest，避免
+          # k8s-sg runner 直接从公网 GHCR 拉层时的低吞吐；digest 仍保持不可变。
           build-args: |
-            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
+            BASE_IMAGE=registry-sg.byted.cs.ac.cn/ghcr/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
           tags: ${{ vars.ICM_REGISTRY }}/agentserver/botmux:${{ needs.build-and-push.outputs.version }}
           labels: ${{ needs.build-and-push.outputs.labels }}
           cache-from: type=gha
