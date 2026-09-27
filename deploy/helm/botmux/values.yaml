@@ -27,6 +27,15 @@ dsh:
     enabled: false
     port: 3080
 
+postgres:
+  enabled: true
+  image: registry-sg.byted.cs.ac.cn/dockerhub/library/postgres:16-alpine
+  database: dsh
+  username: dsh
+  port: 5432
+  storageClass: longhorn
+  storage: 10Gi
+
 ingress:
   enabled: false
   host: ""

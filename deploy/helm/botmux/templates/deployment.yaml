@@ -136,6 +136,19 @@ spec:
                   pnpm add '@deepseek-ai/dsh-tool-ask-user@0.1.7-rc.2'
                 fi
               fi
+              for profile in web botmux; do
+                profile_dir=/home/node/.dsh/profiles/$profile
+                if [ -f "$profile_dir/package.json" ]; then
+                  cd "$profile_dir"
+                  if ! grep -q '"@agentserver/dsh-session-persistence-pg"' package.json; then
+                    pnpm add '@agentserver/dsh-session-persistence-pg@0.1.7-rc.2'
+                  fi
+                  if [ -f cordis.patch.yml ] && ! grep -q '^[[:space:]]*- id: session-persistence-pg$' cordis.patch.yml; then
+                    cat /dsh-config/dsh-persistence.patch.yml >> cordis.patch.yml
+                    chmod 600 cordis.patch.yml
+                  fi
+                fi
+              done
           volumeMounts:
             - name: home
               mountPath: /home/node

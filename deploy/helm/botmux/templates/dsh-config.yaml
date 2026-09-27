@@ -24,9 +24,26 @@ data:
       config:
         provider: openai
         model: {{ .Values.codex.model | quote }}
+    - id: session-persistence-jsonl
+      disabled: true
+    - insert:
+        - id: session-persistence-pg
+          name: '@agentserver/dsh-session-persistence-pg'
+          config:
+            connectionString: !!js process.env.DSH_PG_URL
+            schema: dsh
   agent-default.patch.yml: |
     - id: agent-default-model
       config:
         provider: openai
         model: {{ .Values.codex.model | quote }}
+  dsh-persistence.patch.yml: |
+    - id: session-persistence-jsonl
+      disabled: true
+    - insert:
+        - id: session-persistence-pg
+          name: '@agentserver/dsh-session-persistence-pg'
+          config:
+            connectionString: !!js process.env.DSH_PG_URL
+            schema: dsh
 {{- end }}
