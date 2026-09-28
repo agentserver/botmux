@@ -303,7 +303,7 @@ spec:
           args:
             - |
               set -eu
-              /usr/local/bin/dsh web --no-open --port "$DSH_WEB_PORT" &
+              /usr/local/bin/dsh web --no-open --host "$DSH_WEB_HOST" --port "$DSH_WEB_PORT" &
               pid=$!
               while kill -0 "$pid" 2>/dev/null; do
                 if [ ! -e "$DSH_HOME/settings.yaml" ] && [ -e "$DSH_HOME/settings.yaml.imported" ]; then
@@ -320,6 +320,8 @@ spec:
               value: /home/node/.dsh
             - name: DSH_WEB_PORT
               value: {{ .Values.dsh.web.port | quote }}
+            - name: DSH_WEB_HOST
+              value: {{ .Values.dsh.web.host | quote }}
             - name: DSH_PERMISSION_MODE
               value: danger-full-access
             - name: BKECTL_AUTH_MODE
