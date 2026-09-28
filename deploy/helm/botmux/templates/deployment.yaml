@@ -216,6 +216,8 @@ spec:
               value: /home/node/.botmux/data
             - name: BOTMUX_BOT_INDEX
               value: {{ .Values.botIndex | quote }}
+            - name: DSH_PERMISSION_MODE
+              value: danger-full-access
             {{- if .Values.web.publicUrl }}
             - name: BOTMUX_PUBLIC_URL
               value: {{ .Values.web.publicUrl | trimSuffix "/" | quote }}
@@ -318,6 +320,8 @@ spec:
               value: /home/node/.dsh
             - name: DSH_WEB_PORT
               value: {{ .Values.dsh.web.port | quote }}
+            - name: DSH_PERMISSION_MODE
+              value: danger-full-access
             - name: BKECTL_AUTH_MODE
               value: app_only
             - name: BYTECLOUD_AUTH_ACCESS_KEY_ID
