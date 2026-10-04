@@ -18,7 +18,7 @@ RUN git init \
 RUN pnpm install --frozen-lockfile
 RUN pnpm build
 RUN mkdir -p /out \
-    && pnpm --filter @deepseek-ai/dsh pack --pack-destination /out
+    && pnpm --filter @deepseek-ai/dsh --filter @deepseek-ai/dsh-web-app pack --pack-destination /out
 
 # botmux 基础镜像：安装 GitHub Release 的自包含二进制。
 FROM node:trixie-slim
