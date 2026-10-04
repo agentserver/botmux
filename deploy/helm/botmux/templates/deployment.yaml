@@ -181,7 +181,7 @@ spec:
                 profile_dir=/home/node/.dsh/profiles/$profile
                 seed_dir=/opt/dsh-profiles/$profile
                 marker=$profile_dir/.botmux-dsh-profile-version
-                if [ ! -f "$marker" ] || [ "$(cat "$marker")" != {{ .Values.dsh.versions.cli | quote }} ]; then
+                if [ ! -f "$marker" ] || [ "$(cat "$marker")" != {{ .Values.dsh.versions.cli | quote }} ] || ! grep -q '"@deepseek-ai/dsh-credentials"' "$profile_dir/package.json"; then
                   node -e 'const fs=require("fs"); const seed=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const targetPath=process.argv[2]; let target={}; if(fs.existsSync(targetPath)){try{target=JSON.parse(fs.readFileSync(targetPath,"utf8"));}catch{}} target.dependencies={...(target.dependencies||{}),...(seed.dependencies||{})}; target.dsh=seed.dsh; target["x-botmux-dsh-profile-version"]=seed["x-botmux-dsh-profile-version"]; fs.writeFileSync(targetPath,`${JSON.stringify(target,null,2)}\n`,{mode:0o600});' "$seed_dir/package.json" "$profile_dir/package.json"
                   if [ -e "$profile_dir/node_modules" ]; then mv "$profile_dir/node_modules" "$profile_dir/node_modules.botmux-old"; fi
                   cp -a "$seed_dir/node_modules" "$profile_dir/"
@@ -189,16 +189,6 @@ spec:
                   printf '%s\n' {{ .Values.dsh.versions.cli | quote }} > "$marker"
                   chmod 600 "$marker"
                 fi
-                mkdir -p "$profile_dir/node_modules/@deepseek-ai"
-                cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$profile_dir/node_modules/@deepseek-ai/"
-              done
-              for profile in web botmux; do
-                profile_dir=/home/node/.dsh/profiles/$profile
-                for nested_credentials in $(find "$profile_dir/node_modules/.pnpm" -path '*/node_modules/@deepseek-ai/dsh-credentials' -print 2>/dev/null); do
-                  if [ -L "$nested_credentials" ]; then rm -f "$nested_credentials"; else mv "$nested_credentials" "${nested_credentials}.botmux-old"; fi
-                  cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$nested_credentials"
-                done
-                chown -R 1000:1000 "$profile_dir/node_modules"
               done
               for profile in web botmux; do
                 profile_dir=/home/node/.dsh/profiles/$profile
