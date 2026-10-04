@@ -28,7 +28,7 @@ RUN CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/usr/local/share/codex CODEX_NON
     chown -R node:node /usr/local/share/codex /usr/local/bin/codex /usr/local/bin/codex-code-mode-host; \
     codex --version
 
-ARG DSH_VERSION=0.1.7-rc.2
+ARG DSH_VERSION=0.2.1-alpha.1
 ARG PNPM_VERSION=11.7.0
 RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && mkdir -p /home/node/.dsh \
@@ -36,6 +36,17 @@ RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && DSH_HOME=/home/node/.dsh dsh --version \
     && pnpm --version \
     && npm cache clean --force
+
+# Preinstall the two managed dsh profiles. The Kubernetes init container only
+# copies these files into the persistent home; it never resolves packages from
+# the network during Pod startup.
+COPY deploy/dsh-profiles /opt/dsh-profiles
+RUN set -eux; \
+    for profile in web botmux; do \
+      cd "/opt/dsh-profiles/${profile}"; \
+      pnpm install --config.strict-peer-dependencies=false --ignore-scripts --reporter=append-only; \
+    done; \
+    chown -R node:node /opt/dsh-profiles
 
 WORKDIR /home/node
 

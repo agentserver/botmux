@@ -114,23 +114,7 @@ jobs:
     runs-on: k8s-sg
     timeout-minutes: 30
     steps:
-      - name: Prepare temporary python3 hotfix context
-        run: |
-          set -eu
-          context="$RUNNER_TEMP/botmux-python3-hotfix"
-          mkdir -p "$context"
-          cat > "$context/Dockerfile" <<'EOF'
-          # syntax=docker/dockerfile:1
-          ARG BASE_IMAGE
-          FROM ${BASE_IMAGE}
-          USER root
-          RUN sed -i 's|deb.debian.org|mirrors-sg.byted.cs.ac.cn|g; s|security.debian.org|mirrors-sg.byted.cs.ac.cn|g' /etc/apt/sources.list.d/debian.sources \
-              && apt-get update \
-              && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 \
-              && rm -rf /var/lib/apt/lists/* \
-              && python3 --version
-          USER node
-          EOF
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -155,13 +139,15 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ runner.temp }}/botmux-python3-hotfix
-          file: ${{ runner.temp }}/botmux-python3-hotfix/Dockerfile
-          # 临时复用内网已有 byted 镜像，只追加 python3，绕过 GHCR layer 下载。
+          context: .
+          file: Dockerfile.byted
           platforms: linux/amd64
           push: true
           build-args: |
-            BASE_IMAGE=${{ vars.ICM_REGISTRY }}/agentserver/botmux:3.30.0-byted.2
+            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/botmux@${{ needs.build-and-push.outputs.digest }}
+          secrets: |
+            code_byted_username=${{ secrets.CODE_BYTED_USERNAME }}
+            code_byted_token=${{ secrets.CODE_BYTED_TOKEN }}
           tags: ${{ needs.build-and-push.outputs.byted-tags }}
           labels: ${{ needs.build-and-push.outputs.byted-labels }}
           cache-from: type=gha

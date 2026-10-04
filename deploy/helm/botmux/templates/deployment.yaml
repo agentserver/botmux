@@ -170,21 +170,32 @@ spec:
                 for plugin in web web-search-deepseek web-fetch-http tool-web; do
                   sed -i "/^- id: $plugin$/,/^  disabled: true$/d" /home/node/.dsh/profiles/botmux/cordis.patch.yml
                 done
-                if grep -q '"@deepseek-ai/dsh-tool-ask-user":' /home/node/.dsh/profiles/botmux/package.json \
-                  && ! grep -q '"@deepseek-ai/dsh-tool-ask-user": "0.1.7-rc.2"' /home/node/.dsh/profiles/botmux/package.json; then
-                  cd /home/node/.dsh/profiles/botmux
-                  pnpm add '@deepseek-ai/dsh-tool-ask-user@0.1.7-rc.2'
-                fi
               fi
+              # The image carries the reviewed dependency tree. Copying the
+              # seed is deliberately the only profile migration performed by
+              # this init container; no npm registry is needed at Pod startup.
+              for profile in web botmux; do
+                profile_dir=/home/node/.dsh/profiles/$profile
+                seed_dir=/opt/dsh-profiles/$profile
+                marker=$profile_dir/.botmux-dsh-profile-version
+                if [ ! -f "$marker" ] || [ "$(cat "$marker")" != {{ .Values.dsh.versions.cli | quote }} ]; then
+                  node -e 'const fs=require("fs"); const seed=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const targetPath=process.argv[2]; const target=fs.existsSync(targetPath)?JSON.parse(fs.readFileSync(targetPath,"utf8")):{}; target.dependencies={...(target.dependencies||{}),...(seed.dependencies||{})}; target.dsh=seed.dsh; target["x-botmux-dsh-profile-version"]=seed["x-botmux-dsh-profile-version"]; fs.writeFileSync(targetPath,`${JSON.stringify(target,null,2)}\\n`,{mode:0o600});' "$seed_dir/package.json" "$profile_dir/package.json"
+                  mkdir -p "$profile_dir/node_modules"
+                  cp -a "$seed_dir/node_modules/." "$profile_dir/node_modules/"
+                  printf '%s\n' {{ .Values.dsh.versions.cli | quote }} > "$marker"
+                  chmod 600 "$marker"
+                fi
+              done
               for profile in web botmux; do
                 profile_dir=/home/node/.dsh/profiles/$profile
                 if [ -f "$profile_dir/package.json" ]; then
                   cd "$profile_dir"
-                  if ! grep -q '"@agentserver/dsh-session-persistence-pg": "0.1.7-rc.3"' package.json; then
-                    pnpm add '@agentserver/dsh-session-persistence-pg@0.1.7-rc.3'
-                  fi
                   if [ -f cordis.patch.yml ] && ! grep -q '^[[:space:]]*- id: session-persistence-pg$' cordis.patch.yml; then
                     cat /dsh-config/dsh-persistence.patch.yml >> cordis.patch.yml
+                    chmod 600 cordis.patch.yml
+                  fi
+                  if [ "$profile" = web ] && [ -f cordis.patch.yml ] && ! grep -q '^[[:space:]]*- id: authentication$' cordis.patch.yml; then
+                    cat /dsh-config/dsh-authentication.patch.yml >> cordis.patch.yml
                     chmod 600 cordis.patch.yml
                   fi
                 fi
