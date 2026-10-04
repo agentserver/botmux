@@ -191,6 +191,8 @@ spec:
                   printf '%s\n' {{ .Values.dsh.versions.cli | quote }} > "$marker"
                   chmod 600 "$marker"
                 fi
+                mkdir -p "$profile_dir/node_modules/@deepseek-ai"
+                cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$profile_dir/node_modules/@deepseek-ai/"
               done
               for profile in web botmux; do
                 profile_dir=/home/node/.dsh/profiles/$profile
