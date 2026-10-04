@@ -57,7 +57,8 @@ RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && npm cache clean --force
 
 COPY --from=dsh-fork-builder /opt/dsh-runtime /opt/dsh-runtime
-RUN ln -sf /opt/dsh-runtime/node_modules/.bin/dsh /usr/local/bin/dsh \
+RUN printf '%s\n' '#!/bin/sh' 'exec node /opt/dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js "$@"' > /usr/local/bin/dsh \
+    && chmod 0755 /usr/local/bin/dsh \
     && DSH_HOME=/home/node/.dsh dsh --version
 
 # Preinstall the two managed dsh profiles. The Kubernetes init container only
