@@ -188,7 +188,7 @@ spec:
                 mkdir -p "$profile_dir/node_modules/@deepseek-ai"
                 cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$profile_dir/node_modules/@deepseek-ai/"
                 for nested_credentials in $(find "$profile_dir/node_modules/.pnpm" -path '*/node_modules/@deepseek-ai/dsh-credentials' -print); do
-                  rm -rf "$nested_credentials"
+                  rm -f "$nested_credentials"
                   cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$nested_credentials"
                 done
                 chown -R 1000:1000 "$profile_dir"
