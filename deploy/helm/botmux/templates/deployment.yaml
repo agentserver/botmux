@@ -194,6 +194,9 @@ spec:
                 profile_dir=/home/node/.dsh/profiles/$profile
                 if [ -f "$profile_dir/package.json" ]; then
                   cd "$profile_dir"
+                  if [ -f cordis.patch.yml ]; then
+                    sed -i "s|defaultProvider: !!js process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'|defaultProvider: !!js \\\"process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'\\\"|" cordis.patch.yml
+                  fi
                   if [ -f cordis.patch.yml ] && ! grep -q '^[[:space:]]*- id: session-persistence-pg$' cordis.patch.yml; then
                     cat /dsh-config/dsh-persistence.patch.yml >> cordis.patch.yml
                     chmod 600 cordis.patch.yml

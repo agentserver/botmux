@@ -35,17 +35,17 @@ data:
     - id: authentication
       name: '@agentserver/dsh-authentication'
       config:
-        defaultProvider: !!js process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'
+        defaultProvider: !!js "process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'"
     - id: authentication-token
       name: '@agentserver/dsh-authentication-token'
     - id: authentication-oidc
       name: '@agentserver/dsh-authentication-oidc'
-      disabled: !!js process.env.DSH_OIDC_ISSUER === undefined
+      disabled: !!js "process.env.DSH_OIDC_ISSUER === undefined"
       config:
-        issuer: !!js process.env.DSH_OIDC_ISSUER
-        clientId: !!js process.env.DSH_OIDC_CLIENT_ID
-        clientSecretRef: !!js process.env.DSH_OIDC_CLIENT_SECRET_REF
-        redirectUri: !!js process.env.DSH_OIDC_REDIRECT_URI
+        issuer: !!js "process.env.DSH_OIDC_ISSUER"
+        clientId: !!js "process.env.DSH_OIDC_CLIENT_ID"
+        clientSecretRef: !!js "process.env.DSH_OIDC_CLIENT_SECRET_REF"
+        redirectUri: !!js "process.env.DSH_OIDC_REDIRECT_URI"
   agent-default.patch.yml: |
     - id: agent-default-model
       config:
@@ -64,15 +64,15 @@ data:
     - id: authentication
       name: '@agentserver/dsh-authentication'
       config:
-        defaultProvider: !!js process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'
+        defaultProvider: !!js "process.env.DSH_OIDC_ISSUER === undefined ? 'token' : 'oidc'"
     - id: authentication-token
       name: '@agentserver/dsh-authentication-token'
     - id: authentication-oidc
       name: '@agentserver/dsh-authentication-oidc'
-      disabled: !!js process.env.DSH_OIDC_ISSUER === undefined
+      disabled: !!js "process.env.DSH_OIDC_ISSUER === undefined"
       config:
-        issuer: !!js process.env.DSH_OIDC_ISSUER
-        clientId: !!js process.env.DSH_OIDC_CLIENT_ID
-        clientSecretRef: !!js process.env.DSH_OIDC_CLIENT_SECRET_REF
-        redirectUri: !!js process.env.DSH_OIDC_REDIRECT_URI
+        issuer: !!js "process.env.DSH_OIDC_ISSUER"
+        clientId: !!js "process.env.DSH_OIDC_CLIENT_ID"
+        clientSecretRef: !!js "process.env.DSH_OIDC_CLIENT_SECRET_REF"
+        redirectUri: !!js "process.env.DSH_OIDC_REDIRECT_URI"
 {{- end }}
