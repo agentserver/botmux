@@ -181,7 +181,6 @@ spec:
                 if [ ! -f "$marker" ] || [ "$(cat "$marker")" != {{ .Values.dsh.versions.cli | quote }} ]; then
                   node -e 'const fs=require("fs"); const seed=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const targetPath=process.argv[2]; let target={}; if(fs.existsSync(targetPath)){try{target=JSON.parse(fs.readFileSync(targetPath,"utf8"));}catch{}} target.dependencies={...(target.dependencies||{}),...(seed.dependencies||{})}; target.dsh=seed.dsh; target["x-botmux-dsh-profile-version"]=seed["x-botmux-dsh-profile-version"]; fs.writeFileSync(targetPath,`${JSON.stringify(target,null,2)}\n`,{mode:0o600});' "$seed_dir/package.json" "$profile_dir/package.json"
                   rm -rf "$profile_dir/node_modules"
-                  mkdir -p "$profile_dir/node_modules"
                   cp -a "$seed_dir/node_modules" "$profile_dir/"
                   printf '%s\n' {{ .Values.dsh.versions.cli | quote }} > "$marker"
                   chmod 600 "$marker"
