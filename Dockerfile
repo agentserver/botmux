@@ -1,5 +1,24 @@
 # syntax=docker/dockerfile:1
 
+# Build the agentserver fork from source so the image contains the reviewed
+# all-interface Web binding and authentication integration, rather than the
+# upstream npm artifact with the same version number.
+FROM node:trixie-slim AS dsh-fork-builder
+ARG DSH_REPOSITORY=https://github.com/agentserver/deepseek-harness.git
+ARG DSH_REF=7a7650576061b7ffd73bb95a313abddfe7a50c40
+ARG PNPM_VERSION=11.7.0
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates python3 make g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "pnpm@${PNPM_VERSION}"
+WORKDIR /src/deepseek-harness
+RUN git init \
+    && git remote add origin "${DSH_REPOSITORY}" \
+    && git fetch --depth 1 origin "${DSH_REF}" \
+    && git checkout --detach FETCH_HEAD
+RUN pnpm install --frozen-lockfile
+RUN pnpm build
+RUN pnpm --filter @deepseek-ai/dsh deploy --prod /opt/dsh-runtime
+
 # botmux 基础镜像：安装 GitHub Release 的自包含二进制。
 FROM node:trixie-slim
 
@@ -36,6 +55,10 @@ RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && DSH_HOME=/home/node/.dsh dsh --version \
     && pnpm --version \
     && npm cache clean --force
+
+COPY --from=dsh-fork-builder /opt/dsh-runtime /opt/dsh-runtime
+RUN ln -sf /opt/dsh-runtime/node_modules/.bin/dsh /usr/local/bin/dsh \
+    && DSH_HOME=/home/node/.dsh dsh --version
 
 # Preinstall the two managed dsh profiles. The Kubernetes init container only
 # copies these files into the persistent home; it never resolves packages from
