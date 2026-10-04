@@ -194,6 +194,14 @@ spec:
               done
               for profile in web botmux; do
                 profile_dir=/home/node/.dsh/profiles/$profile
+                for nested_credentials in $(find "$profile_dir/node_modules/.pnpm" -path '*/node_modules/@deepseek-ai/dsh-credentials' -print 2>/dev/null); do
+                  if [ -L "$nested_credentials" ]; then rm -f "$nested_credentials"; else mv "$nested_credentials" "${nested_credentials}.botmux-old"; fi
+                  cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$nested_credentials"
+                done
+                chown -R 1000:1000 "$profile_dir/node_modules"
+              done
+              for profile in web botmux; do
+                profile_dir=/home/node/.dsh/profiles/$profile
                 if [ -f "$profile_dir/package.json" ]; then
                   cd "$profile_dir"
                   if [ -f cordis.patch.yml ]; then
