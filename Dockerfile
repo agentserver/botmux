@@ -58,7 +58,7 @@ RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && npm cache clean --force
 
 COPY --from=dsh-fork-builder /out /tmp/dsh-fork
-RUN npm install -g /tmp/dsh-fork/*.tgz \
+RUN npm install -g --force /tmp/dsh-fork/*.tgz \
     && rm -rf /tmp/dsh-fork \
     && DSH_HOME=/home/node/.dsh dsh --version
 
