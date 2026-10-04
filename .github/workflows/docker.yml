@@ -17,6 +17,11 @@ on:
         description: 自定义镜像 tag（留空则用 commit SHA）
         required: false
         type: string
+      platforms:
+        description: Docker target platforms
+        required: false
+        default: linux/amd64,linux/arm64
+        type: string
 
 permissions:
   contents: read
@@ -95,7 +100,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
           push: true
           build-args: |
             BOTMUX_VERSION=${{ inputs.botmux_version || 'latest' }}
