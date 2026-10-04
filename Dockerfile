@@ -17,7 +17,8 @@ RUN git init \
     && git checkout --detach FETCH_HEAD
 RUN pnpm install --frozen-lockfile
 RUN pnpm build
-RUN pnpm --filter @deepseek-ai/dsh deploy --prod --legacy /opt/dsh-runtime
+RUN mkdir -p /out \
+    && pnpm --filter @deepseek-ai/dsh pack --pack-destination /out
 
 # botmux 基础镜像：安装 GitHub Release 的自包含二进制。
 FROM node:trixie-slim
@@ -56,9 +57,9 @@ RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}" \
     && pnpm --version \
     && npm cache clean --force
 
-COPY --from=dsh-fork-builder /opt/dsh-runtime /opt/dsh-runtime
-RUN printf '%s\n' '#!/bin/sh' 'exec node /opt/dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js "$@"' > /usr/local/bin/dsh \
-    && chmod 0755 /usr/local/bin/dsh \
+COPY --from=dsh-fork-builder /out /tmp/dsh-fork
+RUN npm install -g /tmp/dsh-fork/*.tgz \
+    && rm -rf /tmp/dsh-fork \
     && DSH_HOME=/home/node/.dsh dsh --version
 
 # Preinstall the two managed dsh profiles. The Kubernetes init container only
