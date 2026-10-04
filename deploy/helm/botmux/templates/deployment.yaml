@@ -188,7 +188,7 @@ spec:
                 mkdir -p "$profile_dir/node_modules/@deepseek-ai"
                 cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$profile_dir/node_modules/@deepseek-ai/"
                 for nested_credentials in $(find "$profile_dir/node_modules/.pnpm" -path '*/node_modules/@deepseek-ai/dsh-credentials' -print); do
-                  rm -f "$nested_credentials"
+                  if [ -L "$nested_credentials" ]; then rm -f "$nested_credentials"; else rm -rf "$nested_credentials"; fi
                   cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$nested_credentials"
                 done
                 chown -R 1000:1000 "$profile_dir"
@@ -201,7 +201,7 @@ spec:
               for profile in web botmux; do
                 profile_dir=/home/node/.dsh/profiles/$profile
                 for nested_credentials in $(find "$profile_dir/node_modules/.pnpm" -path '*/node_modules/@deepseek-ai/dsh-credentials' -print 2>/dev/null); do
-                  rm -f "$nested_credentials"
+                  if [ -L "$nested_credentials" ]; then rm -f "$nested_credentials"; else rm -rf "$nested_credentials"; fi
                   cp -a /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials "$nested_credentials"
                 done
                 chown -R 1000:1000 "$profile_dir/node_modules"
