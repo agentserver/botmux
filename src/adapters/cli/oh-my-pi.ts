@@ -3,18 +3,39 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { piTurnBoundaryExtensionPath } from './pi.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
+import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-transcript.js';
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+
+export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
+// A local terminal submit bypasses botmux's input gate. Only active footer
+// shapes may revive an idle cycle; plain "Working..." can be transcript text.
+// Match ANSI-stripped lines (IdleDetector and the viewport probe strip them).
+// omp >= 18.10 reports the same edge over OSC 7501 (supportsProgramStatus);
+// this screen shape is the fallback for older omp or `terminal.programStatus`
+// off. The default `band` composer (nerd symbols) starts the footer with a
+// powerline cap (U+E0B6), then the activity spinner + elapsed time, and puts
+// the context percentage before a `─` rule (other themes use `┃`). omp
+// repositions the cursor (CSI H) instead of writing a newline, so once ANSI is
+// stripped the footer follows the previous row on the same line: the private-
+// use cap is accepted as an anchor in place of `^`. The idle footer shows a
+// status glyph instead of a braille spinner, so it never matches.
+const OMP_ACTIVE_FOOTER_PATTERN =
+  /(?:^[ \t]*|\ue0b6[ \t]*)(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏][ \t]+\d+(?:\.\d+)?(?:ms|s|m|h)(?:\d+(?:\.\d+)?(?:ms|s|m|h))*[ \t]+[^\r\n]*?\d(?:\.\d+)?%[─┃]|●[ \t]+🐴[ \t]+ponytail:)/m;
+const OMP_BUSY_PATTERN = new RegExp(`Working(?:\\.\\.\\.|…)|${OMP_ACTIVE_FOOTER_PATTERN.source}`, 'm');
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -88,7 +109,7 @@ async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<b
     // Emit the markers ourselves instead of relying on backend pasteText():
     // tmux/zellij implement bracketed paste, while herdr's pasteText is only a
     // literal write. One explicit wire format keeps every backend equivalent.
-    if (!sendLiteral(pty, `${BRACKETED_PASTE_START}${chunk}${BRACKETED_PASTE_END}`)) return false;
+    if (!sendLiteral(pty, wrapBracketedPaste(chunk))) return false;
     await delay(OMP_INPUT_THROTTLE_MS);
   }
   return true;
@@ -111,7 +132,27 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 }
 
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
-export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
+/** OMP isolated-session JSONL, addressed only by the botmux adapter session id (no pid
+ *  or cwd discovery). Holds a provisional terminal in driver state until a decisive
+ *  record or a quiet tick proves no plugin continuation follows. */
+export const ompBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainOmpTranscript(
+    path,
+    offset,
+    (ctx.state as OmpTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => ompTranscriptPath(sessionId) ?? undefined,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+};
+
+export function createOhMyPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
   let composerDirty = false;
   let lastClearAttemptAt = 0;
@@ -138,6 +179,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
   return {
     id: 'oh-my-pi',
+    bridgeSpec: ompBridgeSpec,
     authPaths: ['~/.omp/agent'],
     resolvedBin: bin,
 
@@ -147,7 +189,24 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     // as positional launch args: OMP deposits those in the TUI composer but
     // does not auto-submit them. Route prompts through writeInput, where botmux
     // controls the final submit key.
-    buildArgs({ sessionId, resume, model, workingDir, disableCliBypass }) {
+    buildArgs({
+      sessionId,
+      resume,
+      model,
+      workingDir,
+      disableCliBypass,
+      locale,
+      botName,
+      botOpenId,
+      replyDelivery,
+      triggerUserAuth,
+      larkToolAppId,
+      noTransport,
+      solo,
+      skillPluginDir,
+      env,
+      promptInjection,
+    }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
       if (resume) {
@@ -160,8 +219,50 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       }
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
+      if (promptInjection !== 'none') {
+        args.push('--plugin-dir', builtinPluginDirForSession(OMP_PLUGIN_DIR));
+        if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      }
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        larkToolAppId,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+        cliId: 'oh-my-pi',
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // the extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: OMP's CLI
+      // disables native automatic discovery of project/user/foreign APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict complex profile/project/overlay Settings precedence. Appending
+      // via the extension after native discovery completes preserves 100% faithful
+      // native Settings resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension for OMP; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+      args.push('--extension', turnBoundaryExt);
+
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
       return args;
     },
+
+    injectsSessionContext: true,
+    pluginDir: OMP_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     // OMP positional prompts are not an auto-submit channel; stdin injection is
     // the reliable path.
@@ -217,12 +318,24 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
-    busyPattern: /Working(?:\.\.\.|…)/,
+    busyPattern: OMP_BUSY_PATTERN,
+    idleToBusyPattern: OMP_ACTIVE_FOOTER_PATTERN,
+    // omp >= 18.10 emits OSC 7501 (state=working/blocked/done/idle/error)
+    // unprompted on a TTY. Without reports (older omp, or
+    // `terminal.programStatus` off, which sends state=clear) the detector
+    // stays on the screen patterns above.
+    // omp never sends the `ESC]7501;?` probe, so there is no handshake for
+    // tmux's own DA1 answer to win: tmux pipe-pane carries the reports as-is
+    // and the in-pane probe relay (worker, claude-code only) is not needed.
+    supportsProgramStatus: true,
+    // omp reports `state=idle` from InteractiveMode.init() before its
+    // session_start hooks run; a first prompt pasted then is dropped. Startup
+    // readiness stays on screen quiescence; reports after the first idle (or
+    // any working/blocked report) are authoritative.
+    programStatusStartupIdleUntrusted: true,
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: [],
     altScreen: true,
     skillsDir: '~/.omp/agent/skills',
   };
 }
-
-export const create = createOhMyPiAdapter;

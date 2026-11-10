@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 /**
  * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
  *
@@ -11,8 +12,13 @@
  * file is edited.)
  */
 
+import { normalizeEnvPolicy } from '../../core/env-policy.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
-import { newSessionCodexInstanceState, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
+import {
+  newSessionCodexInstanceState,
+  type SessionCliInstanceBindingV1,
+} from '../../services/codex-instance-pool.js';
+import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import {
   V3_SUPPORTED_CLIS,
@@ -63,6 +69,7 @@ function sandboxPathsSnapshot(
 
 /** BotConfig → BotSnapshot (the runtime-frozen, secret-free per-node identity). */
 export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotSnapshot {
+  if (bot.codexProfile) throw new Error('Codex profile is not supported by v3 workflow; choose a Bot without a profile');
   if (bot.disableCliBypass === true) {
     throw new Error(
       `v3 workflow requires CLI bypass permissions, but bot "${bot.name ?? bot.larkAppId}" ` +
@@ -73,14 +80,24 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
   return {
     ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
     larkAppId: bot.larkAppId,
+    ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
-    ...(bot.sandbox === true ? { sandbox: true } : {}),
+    ...(bot.sandbox === true || bot.sandbox === 'oncall'
+      ? { sandbox: true }
+      : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
+    ...(bot.sandbox === 'scratch' ? {
+      ...(bot.scratchStorage ? { scratchStorage: bot.scratchStorage } : {}),
+      ...(bot.scratchTmpfsSizeMb ? { scratchTmpfsSizeMb: bot.scratchTmpfsSizeMb } : {}),
+      ...(bot.scratchDenyPaths?.length ? { scratchDenyPaths: [...bot.scratchDenyPaths] } : {}),
+    } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
 }
@@ -93,14 +110,19 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
 export function freezeDagBotSnapshots(
   dag: V3Dag,
   bots: BotConfig[],
-  opts: { defaultSelector?: string; workingDirOverride?: string } = {},
+  opts: {
+    defaultSelector?: string;
+    workingDirOverride?: string;
+    transformSnapshot?: (snapshot: BotSnapshot) => BotSnapshot;
+  } = {},
 ): Map<string, BotSnapshot> {
   const snapshots = new Map<string, BotSnapshot>();
   const freeze = (selector: string | undefined): void => {
     const key = selector ?? '';
     if (snapshots.has(key)) return;
     const bot = resolveBotConfig(selector ?? opts.defaultSelector, bots);
-    const snapshot = botToSnapshot(bot, opts.workingDirOverride);
+    const baseSnapshot = botToSnapshot(bot, opts.workingDirOverride);
+    const snapshot = opts.transformSnapshot?.(baseSnapshot) ?? baseSnapshot;
     if (!isV3SupportedCli(snapshot.cliId)) {
       throw new Error(
         `v3 workflow bot "${bot.name ?? bot.larkAppId}" uses unsupported CLI "${snapshot.cliId}" ` +
@@ -141,12 +163,16 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'wrapperCli',
     'model',
+    'reasoningEffort',
+    'envPolicy',
     'sandbox',
     'sandboxPaths',
     'sandboxHidePaths',
     'sandboxReadonlyPaths',
     'sandboxNetwork',
+    'sandboxNetworkPolicy',
     'workingDir',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
@@ -155,6 +181,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] must be an object`);
     }
     const obj = value as Record<string, unknown>;
+    if (obj.envPolicy !== undefined) normalizeEnvPolicy(obj.envPolicy);
     const extra = Object.keys(obj).filter((field) => !allowed.has(field));
     if (extra.length > 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] has unsupported key(s): ${extra.join(', ')}`);
@@ -170,10 +197,13 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
+    }
+    if (obj.reasoningEffort !== undefined && !isCodexReasoningEffort(obj.reasoningEffort)) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort is invalid`);
     }
     for (const field of ['sandbox', 'sandboxNetwork'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
@@ -210,22 +240,39 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     const parsedSandboxPaths = sandboxPathsSnapshot(obj.sandboxPaths as BotSnapshot['sandboxPaths']);
     if (obj.cliInstanceBinding !== undefined) {
       const b = obj.cliInstanceBinding as SessionCliInstanceBindingV1;
-      if (!b || b.version !== 1 || b.source !== 'default' || b.cliId !== 'codex' || obj.cliId !== 'codex'
-          || b.authMode !== 'isolated' || typeof b.instanceId !== 'string' || typeof b.codexHome !== 'string'
-          || !b.codexHome.startsWith('/')) throw new Error('invalid frozen workflow Codex instance binding');
+      const defaultBinding = b?.source === 'default' && b.authMode === 'isolated' && typeof b.instanceId === 'string';
+      const goalBinding = b?.source === 'goal' && b.authMode === 'shared' && b.instanceId === null;
+      if (!b || b.version !== 1 || (!defaultBinding && !goalBinding) || b.cliId !== 'codex' || obj.cliId !== 'codex'
+          || typeof b.codexHome !== 'string' || !b.codexHome.startsWith('/')) {
+        throw new Error('invalid frozen workflow Codex instance binding');
+      }
+      if (goalBinding && (typeof obj.model !== 'string' || !obj.model
+          || !isCodexReasoningEffort(obj.reasoningEffort) || obj.wrapperCli !== undefined)) {
+        throw new Error('goal-scoped Codex binding requires an unwrapped frozen model and reasoning effort');
+      }
     }
     snapshots.set(key, {
       ...(obj.cliInstanceBinding ? { cliInstanceBinding: obj.cliInstanceBinding as SessionCliInstanceBindingV1,
         cliRuntime: obj.cliRuntime as BotSnapshot['cliRuntime'] } : {}),
       larkAppId: obj.larkAppId,
+      ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
-      ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
+      ...(obj.reasoningEffort !== undefined
+        ? { reasoningEffort: obj.reasoningEffort as BotSnapshot['reasoningEffort'] }
+        : {}),
+      ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
+        : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),
+      ...(obj.scratchStorage !== undefined ? { scratchStorage: obj.scratchStorage as 'tmpfs' | 'disk' } : {}),
+      ...(obj.scratchTmpfsSizeMb !== undefined ? { scratchTmpfsSizeMb: obj.scratchTmpfsSizeMb as number } : {}),
+      ...(Array.isArray(obj.scratchDenyPaths) ? { scratchDenyPaths: [...obj.scratchDenyPaths as string[]] } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
       ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
+      ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
       workingDir: obj.workingDir,
     });
   }

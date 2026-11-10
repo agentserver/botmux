@@ -104,7 +104,7 @@ describe('dashboard group mutation route auth', () => {
     rootDir = '';
   });
 
-  it('returns 401 before reaching the daemon for anonymous PUTs, including publicReadOnly mode', async () => {
+  it.each([['pin-streaming-card', 'chat-pin-streaming-card'], ['serial-input', 'group-serial-input']])('guards %s before reaching the daemon, including publicReadOnly mode', async (route, daemonRoute) => {
     rootDir = mkdtempSync(join(tmpdir(), 'botmux-dashboard-pin-auth-'));
     const homeDir = join(rootDir, 'home');
     const botmuxDir = join(homeDir, '.botmux');
@@ -129,12 +129,19 @@ describe('dashboard group mutation route auth', () => {
       for await (const chunk of req) bodyChunks.push(chunk as Buffer);
       const body = Buffer.concat(bodyChunks).toString('utf8');
       if (req.method === 'PUT' && (
-        url === '/api/chat-pin-streaming-card/oc%20auth%2Ftopic'
+        url === `/api/${daemonRoute}/oc%20auth%2Ftopic`
         || url === '/api/groups/oc%20auth%2Ftopic/name'
       )) {
         daemonWrites.push({ method: req.method, url, body });
         res.writeHead(202, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, changed: true }));
+        return;
+      }
+      if ((req.method === 'GET' && url === '/api/groups/oc_group/messages?pageToken=next%2B')
+        || (req.method === 'POST' && url === '/api/groups/oc_group/messages/recall')) {
+        daemonWrites.push({ method: req.method, url, body });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, messages: [], results: [] }));
         return;
       }
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -181,7 +188,7 @@ describe('dashboard group mutation route auth', () => {
     );
     const base = `http://127.0.0.1:${dashboardPort}`;
     const pinRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
-      + `/pin-streaming-card/${encodeURIComponent('cli auth-test-app')}`;
+      + `/${route}/${encodeURIComponent('cli auth-test-app')}`;
     const renameRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
       + `/name/${encodeURIComponent('cli auth-test-app')}`;
     const anonymousPin = () => requestLoopback(pinRoute, {
@@ -201,7 +208,7 @@ describe('dashboard group mutation route auth', () => {
       status: 202,
       daemonWrites: [{
         method: 'PUT',
-        url: '/api/chat-pin-streaming-card/oc%20auth%2Ftopic',
+        url: `/api/${daemonRoute}/oc%20auth%2Ftopic`,
         body: '{"enabled":false}',
       }],
     });
@@ -224,6 +231,23 @@ describe('dashboard group mutation route auth', () => {
       }],
     });
     daemonWrites.length = 0;
+
+    const messageRoute = `${base}/api/groups/oc_group/messages/${encodeURIComponent('cli auth-test-app')}`;
+    for (const method of ['GET', 'POST']) {
+      const target = method === 'GET' ? `${messageRoute}?pageToken=next%2B` : `${messageRoute}/recall`;
+      const init = { method, headers: { 'content-type': 'application/json' },
+        ...(method === 'POST' ? { body: '{"messageIds":["om_message"]}' } : {}) };
+      expect((await requestLoopback(target, init)).status).toBe(401);
+      expect(daemonWrites).toHaveLength(0);
+      expect((await requestLoopback(target, { ...init,
+        headers: { ...init.headers, cookie: `botmux_dashboard_token=${dashboardToken}` },
+      })).status).toBe(200);
+      expect(daemonWrites).toEqual([{ method,
+        url: method === 'GET' ? '/api/groups/oc_group/messages?pageToken=next%2B' : '/api/groups/oc_group/messages/recall',
+        body: method === 'POST' ? '{"messageIds":["om_message"]}' : '',
+      }]);
+      daemonWrites.length = 0;
+    }
 
     const oversizedRename = await requestLoopback(renameRoute, {
       method: 'PUT',

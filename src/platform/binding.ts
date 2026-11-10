@@ -55,6 +55,26 @@ export function readPlatformBinding(): PlatformBinding | null {
   return null;
 }
 
+/**
+ * The machine owner as recorded in the machine token payload (`<b64url>.<sig>`,
+ * signed by the platform). Read WITHOUT verifying the signature — only the
+ * platform can — so it may only steer advisory UX (which `/login` hint to
+ * show), never an authorization decision.
+ */
+export function platformMachineOwner(binding: PlatformBinding | null = readPlatformBinding()): { unionId?: string; name?: string } {
+  if (!binding) return {};
+  try {
+    const payloadB64 = binding.machineToken.split('.')[0] ?? '';
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as { unionId?: unknown; ownerName?: unknown };
+    return {
+      ...(typeof payload.unionId === 'string' && payload.unionId ? { unionId: payload.unionId } : {}),
+      ...(typeof payload.ownerName === 'string' && payload.ownerName ? { name: payload.ownerName } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 export function writePlatformBinding(b: PlatformBinding): void {
   writeSecureHostFileSync(PLATFORM_BINDING_PATH, `${JSON.stringify(b, null, 2)}\n`);
 }
@@ -83,6 +103,23 @@ export function platformMachineBaseUrl(): string | null {
   try {
     const u = new URL(b.platformUrl);
     return `${u.protocol}//m-${b.machineId}.${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 绑定平台后，Web 终端对外可达的「终端子域」基址
+ * `https://t-<machineId>.<平台域名>`。管理 Dashboard 继续走 m-，但平台把
+ * `/s/<sessionId>` 终端页挂在独立的 t- 子域；把卡片终端链接发到 m- 会在平台前门
+ * 被拒，表现为浏览器打开后 Forbidden。
+ */
+export function platformTerminalBaseUrl(): string | null {
+  const b = readPlatformBinding();
+  if (!b) return null;
+  try {
+    const u = new URL(b.platformUrl);
+    return `${u.protocol}//t-${b.machineId}.${u.host}`;
   } catch {
     return null;
   }

@@ -12,20 +12,26 @@
  *
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import {
   beginReplyTargetTurn,
   buildTurnParticipantsFrom,
   collectTurnWindowParticipants,
+  cronPinnedTurnIds,
+  CRON_TASK_ANCHORS_MAX,
   fallbackTurnId,
   frozenReplyContextForTurn,
+  inheritTurnReplyRouting,
   isSubstituteTurn,
   pickTurnReplyTarget,
+  reconcileCronTaskReplyAnchors,
   rehomeReplyTargetState,
   resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { inheritTriggerReplyAnchor } from '../src/core/trigger-final-suppression.js';
 
 const NOW = new Date().toISOString();
 
@@ -485,6 +491,246 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(pickTurnReplyTarget(ds.session, 'turn-0')).toBeUndefined();
     expect(pickTurnReplyTarget(ds.session, 'turn-39')?.senderOpenId).toBe('ou_39');
   });
+
+  // ── Round-4 Must fix: a live cron task's create-turn must not be LRU-evicted ──
+
+  it('pins the cron create-turn: 32+ newer turns still route the fire into topic A', () => {
+    // Reviewer replay, exact boundary: create the task in topic A (turn-cron),
+    // then run 40 newer ordinary turns in the same chat-scope session. Without
+    // the pin, turn-cron is the 41st-oldest and gets evicted; the scheduled
+    // fire resolves to the group top level.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = {
+      jobA: { turnId: 'turn-cron', createdAtMs: t0 },
+    };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString(), { senderOpenId: `ou_${i}` });
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    // 32 ordinary slots + 1 pinned extra slot.
+    expect(keys.length).toBe(33);
+    expect(keys).toContain('turn-cron');
+    expect(keys).not.toContain('turn-1'); // oldest unpinned evicted (40 - 32 = 8: turn-1..turn-8)
+    expect(keys).toContain('turn-40');
+    // The fire carries replyTurnId=turn-cron: still a thread reply into A.
+    expect(resolveSessionReplyTarget(ds, 'turn-cron')).toEqual({ mode: 'thread', rootMessageId: 'om_topicA' });
+  });
+
+  it('without the pin the same 32-turn boundary drops the fire to the group top level', () => {
+    // Control: proves the regression the pin fixes. No cronTaskReplyAnchors →
+    // identical map, identical boundary, turn-cron is evicted and routes plain.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    for (let i = 1; i <= 32; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    expect(keys.length).toBe(32);
+    expect(keys).not.toContain('turn-cron');
+    expect(resolveSessionReplyTarget(ds, 'turn-cron')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('deleting the task from the anchor snapshot un-pins its turn on the next prune', () => {
+    // Worker is the authority: when the task expires/delete-syncs away, the
+    // extra slot becomes evictable again instead of leaking forever.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = { jobA: { turnId: 'turn-cron', createdAtMs: t0 } };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    expect(Object.keys(ds.session.replyTargets ?? {})).toContain('turn-cron');
+    // Worker snapshot no longer contains jobA (full-snapshot replace).
+    ds.session.cronTaskReplyAnchors = reconcileCronTaskReplyAnchors(undefined, []).anchors;
+    beginReplyTargetTurn(ds, 'om_41', 'turn-41', new Date(t0 + 41_000).toISOString());
+    expect(Object.keys(ds.session.replyTargets ?? {})).not.toContain('turn-cron');
+  });
+
+  it('pinned eviction leaves the prune watermark driven only by actually evicted unpinned turns', () => {
+    // The --mention-back ambiguity gate reads replyTargetsPrunedThrough: pins
+    // must not suppress the watermark update for the unpinned records that DO
+    // get evicted alongside the pinned extra slot.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = { jobA: { turnId: 'turn-cron', createdAtMs: t0 } };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    // 8 unpinned evicted: turn-1..turn-8 → watermark at turn-8 (same math as
+    // the unpinned case, the pinned record simply is not a candidate).
+    expect(ds.session.replyTargetsPrunedThrough).toBe(new Date(t0 + 8 * 1000).toISOString());
+  });
+});
+
+describe('background task reply pins', () => {
+  /** A topic-A turn launches a background task, then `newer` turns run in
+   *  topic B before the task's wake answer is routed back to the launch turn. */
+  function routeAfter(newer: number, pins?: string[]) {
+    const ds = makeDs(pins ? { backgroundTaskPinnedTurnIds: pins } : {}) as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-launch', new Date(t0).toISOString());
+    for (let i = 1; i <= newer; i++) {
+      beginReplyTargetTurn(ds, 'om_topicB', `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    // The resolver a worker final_output with replyTurnId goes through.
+    return frozenReplyContextForTurn(ds, 'turn-launch').target;
+  }
+
+  it('keeps the launching turn routable while its task runs, however many turns follow', () => {
+    expect(routeAfter(300, ['turn-launch'])).toEqual({ mode: 'thread', rootMessageId: 'om_topicA' });
+    // Control: unpinned, the launch turn's records are evicted and the answer
+    // would land at the group top level.
+    expect(routeAfter(300)).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  // The other two replyTargets writers prune through the same pin set: with
+  // the bound already reached, their new record must evict an unpinned turn,
+  // never the launch turn of a running task.
+  function boundReached(pins?: string[]): DaemonSession {
+    const ds = makeDs({
+      ...(pins ? { backgroundTaskPinnedTurnIds: pins } : {}),
+      currentReplyTarget: { rootMessageId: 'om_topicB', turnId: 'turn-31', updatedAt: NOW },
+    }) as DaemonSession;
+    const t0 = Date.parse(NOW);
+    ds.session.replyTargets = { 'turn-launch': { rootMessageId: 'om_topicA', updatedAt: new Date(t0).toISOString() } };
+    for (let i = 1; i <= 31; i++) {
+      ds.session.replyTargets[`turn-${i}`] = { rootMessageId: 'om_topicB', updatedAt: new Date(t0 + i * 1000).toISOString() };
+    }
+    return ds;
+  }
+  for (const [writer, write] of [
+    ['inheritTurnReplyRouting', (ds: DaemonSession) => { inheritTurnReplyRouting(ds, 'turn-31', 'turn-recovered'); }],
+    ['inheritTriggerReplyAnchor', (ds: DaemonSession) => { inheritTriggerReplyAnchor(ds, 'trg-1', new Date(Date.parse(NOW) + 60_000).toISOString()); }],
+  ] as const) {
+    it(`${writer} keeps a pinned launch turn when it prunes`, () => {
+      const pinned = boundReached(['turn-launch']);
+      write(pinned);
+      expect(Object.keys(pinned.session.replyTargets ?? {})).toContain('turn-launch');
+      const control = boundReached();
+      write(control);
+      expect(Object.keys(control.session.replyTargets ?? {})).not.toContain('turn-launch');
+    });
+  }
+
+  it('the daemon takes the pin set from its current worker and drops it when that worker exits', async () => {
+    const { __testOnly_setupWorkerHandlers, initWorkerPool } = await import('../src/core/worker-pool.js');
+    const { registerBot, __testOnly_resetBotRegistry } = await import('../src/bot-registry.js');
+    const sessionStore = await import('../src/services/session-store.js');
+    registerBot({ larkAppId: 'cli_bgpin', larkAppSecret: 'secret', cliId: 'claude-code' });
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_card'), getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const persist = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    try {
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false, send: vi.fn(), kill: vi.fn(), pid: 4343, stdout: new EventEmitter(), stderr: new EventEmitter(),
+      });
+      const ds = {
+        session: { sessionId: 'bg-pin-sync', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group', status: 'active' },
+        worker, larkAppId: 'cli_bgpin', chatId: 'oc_chat', chatType: 'group', scope: 'chat',
+      } as unknown as DaemonSession;
+      __testOnly_setupWorkerHandlers(ds, worker as any);
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: ['om_A', 'om_A', 7, '', 'om_B'] });
+      expect(ds.backgroundTaskPinnedTurnIds).toEqual(['om_A', 'om_B']);
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: [] });
+      expect(ds.backgroundTaskPinnedTurnIds).toBeUndefined();
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: ['om_C'] });
+      expect(ds.backgroundTaskPinnedTurnIds).toEqual(['om_C']);
+      worker.emit('exit', 0, null);
+      expect(ds.backgroundTaskPinnedTurnIds).toBeUndefined();
+    } finally {
+      persist.mockRestore();
+      __testOnly_resetBotRegistry();
+    }
+  });
+});
+
+describe('cron task reply anchors (daemon-side mirror)', () => {
+  it('cronPinnedTurnIds collects distinct non-null turn ids', () => {
+    expect(cronPinnedTurnIds(undefined).size).toBe(0);
+    const pinned = cronPinnedTurnIds({
+      a: { turnId: 'om_A', createdAtMs: 1 },
+      b: { turnId: 'om_A', createdAtMs: 1 }, // duplicate, deduped
+      c: { turnId: null, createdAtMs: 1 },   // local-created task pins nothing
+    });
+    expect([...pinned]).toEqual(['om_A']);
+  });
+
+  it('full-snapshot replace drops absent tasks and nulls are preserved', () => {
+    const first = reconcileCronTaskReplyAnchors(undefined, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobLocal', turnId: null },
+    ], 1000);
+    expect(Object.keys(first.anchors).sort()).toEqual(['jobA', 'jobLocal']);
+    // Next snapshot: jobA survives, jobLocal gone, jobB added.
+    const next = reconcileCronTaskReplyAnchors(first.anchors, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobB', turnId: 'om_B' },
+    ], 2000);
+    expect(Object.keys(next.anchors).sort()).toEqual(['jobA', 'jobB']);
+    expect(next.anchors.jobA.createdAtMs).toBe(1000); // known task keeps original stamp
+    expect(next.anchors.jobB.createdAtMs).toBe(2000);
+  });
+
+  it('is bounded to 64 oldest-first and every retained id is pinnable', () => {
+    const incoming = Array.from({ length: CRON_TASK_ANCHORS_MAX + 10 }, (_, i) =>
+      ({ taskId: `job${i}`, turnId: `om_${i}` }));
+    const { anchors, pinned } = reconcileCronTaskReplyAnchors(undefined, incoming, 1000);
+    expect(Object.keys(anchors)).toHaveLength(CRON_TASK_ANCHORS_MAX);
+    expect(anchors.job0).toBeUndefined();          // oldest 10 shed
+    expect(anchors[`job${CRON_TASK_ANCHORS_MAX + 9}`]).toBeDefined();
+    expect(pinned.size).toBe(CRON_TASK_ANCHORS_MAX);
+  });
+
+  it('re-attaches keep FIFO order via preserved createdAtMs even when the snapshot reorders', () => {
+    const first = reconcileCronTaskReplyAnchors(undefined, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobB', turnId: 'om_B' },
+    ], 1000);
+    const shuffled = reconcileCronTaskReplyAnchors(first.anchors, [
+      { taskId: 'jobB', turnId: 'om_B' },
+      { taskId: 'jobA', turnId: 'om_A' },
+    ], 5000);
+    expect(shuffled.anchors.jobA.createdAtMs).toBe(1000);
+    expect(shuffled.anchors.jobB.createdAtMs).toBe(1000);
+  });
+
+  it('the daemon mirrors a worker anchor snapshot onto the session and persists it', async () => {
+    const { __testOnly_setupWorkerHandlers, initWorkerPool } = await import('../src/core/worker-pool.js');
+    const sessionStore = await import('../src/services/session-store.js');
+    const { registerBot, __testOnly_resetBotRegistry } = await import('../src/bot-registry.js');
+    registerBot({ larkAppId: 'cli_anchor', larkAppSecret: 'secret', cliId: 'claude-code' });
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_card'), getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const persisted: unknown[] = [];
+    const persist = vi.spyOn(sessionStore, 'updateSession')
+      .mockImplementation(session => { persisted.push(structuredClone(session.cronTaskReplyAnchors)); });
+    try {
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false, send: vi.fn(), kill: vi.fn(), pid: 4242, stdout: new EventEmitter(), stderr: new EventEmitter(),
+      });
+      const ds = {
+        session: { sessionId: 'cron-anchor-sync', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group' },
+        worker, larkAppId: 'cli_anchor', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
+      } as unknown as DaemonSession;
+      __testOnly_setupWorkerHandlers(ds, worker as any);
+      worker.emit('message', { type: 'cron_task_anchors_sync',
+        anchors: [{ taskId: 'jobA', turnId: 'om_A' }, { taskId: 'jobB', turnId: null }, { bogus: true }] });
+      const expected = {
+        jobA: { turnId: 'om_A', createdAtMs: expect.any(Number) },
+        jobB: { turnId: null, createdAtMs: expect.any(Number) },
+      };
+      expect(ds.session.cronTaskReplyAnchors).toEqual(expected);
+      expect(persisted.at(-1)).toEqual(expected);
+    } finally {
+      persist.mockRestore();
+      __testOnly_resetBotRegistry();
+    }
+  });
 });
 
 describe('buildTurnParticipantsFrom (pure per-message contribution)', () => {
@@ -630,5 +876,47 @@ describe('frozen reply context', () => {
       replyTargetSenderOpenId: 'ou_b',
       replyTargetSenderIsBot: true,
     });
+  });
+});
+
+// A chat-scope card button carries the CHAT id as its `root_id`. Passing that
+// through as a reply root used to freeze `{ mode: 'thread', rootMessageId: oc_… }`,
+// after which every rootless daemon post (worker-ready card, static fallback)
+// replied to a chat id and failed with Lark 230001 until a new IM turn arrived.
+describe('chat id is never a reply root', () => {
+  it('resolveInboundReplyTarget keeps a chat-scope turn flat when the "reply root" is the chat id', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat', chatId: 'oc_chat', threadRootId: 'oc_chat', replyRootId: 'oc_chat',
+    })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('beginReplyTargetTurn does not record a chat id as the turn root, alias or current target', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'oc_chat', 'om_card', NOW, { senderOpenId: 'ou_user' });
+    expect(ds.session.turnReplyContexts?.om_card?.target).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+    expect(ds.session.replyTargets?.om_card?.rootMessageId).toBeUndefined();
+    expect(ds.session.replyThreadAliases?.oc_chat).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(resolveSessionReplyTarget(ds, fallbackTurnId(ds))).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('heals a session that already persisted a chat id as its thread root', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'oc_chat', turnId: 'om_card', updatedAt: NOW },
+    }) as DaemonSession;
+    ds.session.currentReplyTarget = { rootMessageId: 'oc_chat', turnId: 'om_card', updatedAt: NOW };
+    ds.session.replyTargets = { om_card: { rootMessageId: 'oc_chat', updatedAt: NOW } };
+    ds.session.turnReplyContexts = { om_card: { target: { mode: 'thread', rootMessageId: 'oc_chat' } } };
+
+    const turnId = fallbackTurnId(ds);
+    expect(turnId).toBe('om_card');
+    expect(frozenReplyContextForTurn(ds, turnId).target).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+    expect(resolveSessionReplyTarget(ds, turnId)).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('still honours a real topic root in chat scope', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat', chatId: 'oc_chat', threadRootId: 'oc_chat', replyRootId: 'om_topic',
+    })).toEqual({ mode: 'thread', rootMessageId: 'om_topic' });
   });
 });

@@ -81,6 +81,53 @@ function cleanup(f: ReturnType<typeof fixture>, plan: ReturnType<typeof prepareD
 }
 
 describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
+  it('rejects a short temp alias without an exact writable scratch grant', () => {
+    const f = fixture();
+    const scratch = join(f.workspace, 'scratch');
+    const alias = join(f.root, 'short-scratch');
+    mkdirSync(scratch);
+    symlinkSync(scratch, alias);
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      expect(() => {
+        plan = prepareDirectSandbox({ sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+          chdir: f.workspace, home: f.home, cliBin: '/bin/true', cliArgs: [], tempDir: alias });
+      }).toThrow(/exact writable scratch grant/);
+    } finally { cleanup(f, plan); }
+  });
+
+  it('keeps a short scratch alias writable without bypassing deny masks or exposing siblings', () => {
+    const f = fixture();
+    const scratch = join(f.root, 'cache', 'session');
+    const sibling = join(f.root, 'cache', 'sibling');
+    mkdirSync(scratch, { recursive: true });
+    mkdirSync(sibling);
+    writeFileSync(join(scratch, 'secret'), 'must-stay-hidden');
+    const alias = join(f.root, 'short-scratch');
+    symlinkSync(scratch, alias);
+    f.policy.rules.push(
+      { path: scratch, access: 'readWrite', source: 'internal' },
+      { path: join(scratch, 'secret'), access: 'deny', source: 'internal' },
+    );
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+        chdir: f.workspace, home: f.home, cliBin: '/bin/bash',
+        cliArgs: ['-c', 'printf artifact > "$TMPDIR/artifact"; test "$(cat "$TMPDIR/secret")" != must-stay-hidden && test ! -e "$TMPDIR/../sibling"'],
+        tempDir: alias });
+      expect(plan).not.toBeNull();
+      expect(plan!.env.TMPDIR).toBe(alias);
+      const index = plan!.args.findIndex((arg, i, args) => arg === '--symlink' && args[i + 1] === scratch && args[i + 2] === alias);
+      expect(index).toBeGreaterThan(-1);
+      expect(plan!.args.slice(index, index + 3)).toEqual(['--symlink', scratch, alias]);
+      if (canRunBwrap) {
+        const result = spawnSync(plan!.bin, plan!.args, { env: { ...process.env, ...plan!.env }, timeout: 10_000 });
+        expect(result.status, result.stderr?.toString()).toBe(0);
+        expect(readFileSync(join(scratch, 'artifact'), 'utf8')).toBe('artifact');
+      }
+    } finally { cleanup(f, plan); }
+  });
+
   it.each(['home-link', 'data-link', 'canonical'] as const)(
     'pins the mounted root in both the child env and bwrap argv (%s)', layout => {
       const f = fixture(layout);
@@ -131,7 +178,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
     }
   });
 
-  it.skipIf(!canRunBwrap)('creates a schedule for the inferred session inside the real sandbox', () => {
+  it.skipIf(!canRunBwrap)('does not inherit owner from an un-attested real sandbox', () => {
     const f = fixture('home-link');
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
@@ -164,13 +211,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
         encoding: 'utf8', timeout: 15_000,
       });
       expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain('已创建定时任务');
-      const store = JSON.parse(readFileSync(join(f.ownBotHome, 'schedules.json'), 'utf8'));
-      expect(Object.values(store)).toEqual([expect.objectContaining({
-        chatId: 'oc_own', larkAppId: 'app-a', ownerOpenId: 'ou_owner',
-        workingDir: f.workspace, prompt: 'fixture reminder',
-      })]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('无法验证本轮调用者');
+      expect(existsSync(join(f.ownBotHome, 'schedules.json'))).toBe(false);
     } finally {
       cleanup(f, plan);
     }
@@ -267,7 +310,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
           'BOTMUX_HOST_RELAY_AUTHORIZED=1', command, ...prefixArgs,
           // If classification ever regresses, stop at the later argument
           // validation gate. No credentials, provider request or network.
-          join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--video'],
+          join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--video', '/tmp/unused.mp4'],
       });
       expect(plan).not.toBeNull();
       const args = [...plan!.args];
@@ -301,7 +344,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
             printf session > "$SESSION_DATA_DIR/.botmux-cli-pids/$$"
             "$@"
           `, 'marker-fixture', command, ...prefixArgs, join(repoRoot, 'src/cli.ts'),
-          'send', 'fixture', '--video'],
+          'send', 'fixture', '--video', '/tmp/unused.mp4'],
       });
       expect(plan).not.toBeNull();
       const result = spawnSync(plan!.bin, plan!.args, {
@@ -326,9 +369,10 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       plan = prepareDirectSandbox({
         sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
         chdir: repoRoot, home: f.home, cliBin: command,
-        // This flag is rejected at the start of relaySend, proving that the
-        // normal relay path was reached without issuing any real request.
-        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--top-level'],
+        // A syntactically valid proposal path whose file is missing is rejected
+        // INSIDE relaySend, proving the normal relay path was reached without
+        // issuing any real request (send's argv preflight accepts it first).
+        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file', '/tmp/unused.json'],
       });
       expect(plan).not.toBeNull();
       writeFileSync(join(plan!.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
@@ -339,8 +383,10 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
         encoding: 'utf8', timeout: 15_000,
       });
       expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain('ROUTING_NOT_SUPPORTED');
+      // Relay reached: it owns the missing-proposal-file error (exit 1), not
+      // send's argv preflight.
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('relay: 文件不存在: /tmp/unused.json');
     } finally {
       cleanup(f, plan);
     }

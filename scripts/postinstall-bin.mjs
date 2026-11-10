@@ -178,13 +178,23 @@ function locationSaysGlobal(root) {
   const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
   // Every global layout below ends at the main package; anything else is not ours.
   if (!r.endsWith('/node_modules/botmux')) return false;
+  // PNPM_HOME as exported and as resolved: `root` is a realpath, so a PNPM_HOME
+  // spelled through a symlinked home only matches once resolved.
+  const pnpmHome = process.env.PNPM_HOME || '';
+  let pnpmHomeReal = '';
+  try { if (pnpmHome) pnpmHomeReal = realpathSync(pnpmHome); } catch { /* missing: as spelled only */ }
+  const pnpmStores = [pnpmHome, pnpmHomeReal]
+    .map(p => `${p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()}/store/`)
+    .filter(s => s !== '/store/');
   return r.endsWith('/lib/node_modules/botmux')                    // npm, POSIX
     || r.includes('/.bun/install/global/node_modules/botmux')      // bun
     || r.includes('/bun/install/global/node_modules/botmux')       // bun, custom BUN_INSTALL
     || r.includes('/.pnpm/')                                       // pnpm virtual store
     || /\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(r)      // pnpm 9 global
     || /\/pnpm\/global\/v\d+\/[^/]+\/node_modules\/botmux$/.test(r) // pnpm 11 global
-    || /\/pnpm\/store\/v\d+\/links\/@\/botmux\//.test(r);          // pnpm 11 store links
+    || /\/pnpm\/store\/v\d+\/links\/@\/botmux\//.test(r)           // pnpm 11 store links
+    || pnpmStores.some(s => r.startsWith(s)                        // …under a custom PNPM_HOME
+      && /^v\d+\/links\/@\/botmux\//.test(r.slice(s.length)));
 }
 
 if (process.env.npm_config_global !== 'true' && !locationSaysGlobal(pkgRoot)) {
@@ -330,8 +340,9 @@ try {
 // This used to only PRINT `echo 'export PATH=…' >> ~/.profile`. Two problems:
 // the user had to act on it, and for zsh users the suggested file is WRONG —
 // zsh never reads ~/.profile (measured), so following the hint verbatim left
-// `botmux` still not found. There is no `bin` field any more, so PATH is the
-// only way this launcher becomes a command; we now write the right startup file
+// `botmux` still not found. PATH is the only way THIS launcher becomes a
+// command (the package's own `bin` is linked by the package manager and is a
+// separate entry point); we now write the right startup file
 // for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
 //
 // ⚠️ DO NOT GATE THIS ON `process.env.PATH`. It used to be wrapped in
@@ -386,3 +397,5 @@ try {
     console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds`);
   }
 }
+
+console.log('[botmux] 若 daemon 正在运行，请执行 botmux restart 应用新版本');

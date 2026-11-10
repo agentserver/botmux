@@ -18,12 +18,22 @@ import {
 import { addChatGrant, removeChatGrant } from './grant-store.js';
 
 export type ExactChatGrantOperation = 'grant' | 'revoke' | 'readback';
+/** `resolve` (stable app ids only): which open_id the receiver's app sees
+ *  for each subject bot in this chat — read only, nothing is written. Lets a
+ *  caller record the exact open_id BEFORE asking for a grant, so a grant
+ *  whose answer is lost can still be revoked by open_id later. */
+export type ExactChatGrantByLarkAppIdsOperation = 'grant' | 'resolve';
 
 export interface ExactChatGrantInput {
   operation: unknown;
   receiverLarkAppId: string;
   chatId: unknown;
   subjectOpenIds: unknown;
+  /** Optional per-subject message quota (already normalized to a positive integer). */
+  quota?: unknown;
+  /** Optional relative validity window in ms (already normalized to a positive
+   * integer); converted server-side to an absolute expiresAt. */
+  durationMs?: unknown;
 }
 
 export interface ExactChatGrantByLarkAppIdsInput {
@@ -31,6 +41,8 @@ export interface ExactChatGrantByLarkAppIdsInput {
   receiverLarkAppId: string;
   chatId: unknown;
   subjectLarkAppIds: unknown;
+  quota?: unknown;
+  durationMs?: unknown;
 }
 
 export type ExactChatGrantRequestInput = ExactChatGrantInput | ExactChatGrantByLarkAppIdsInput;
@@ -45,7 +57,7 @@ export interface ExactChatGrantSubjectResult {
 
 export interface ExactChatGrantSuccess {
   ok: true;
-  operation: ExactChatGrantOperation;
+  operation: ExactChatGrantOperation | 'resolve';
   permissionSource: 'chatGrant';
   talkOnly: true;
   receiverLarkAppId: string;
@@ -82,7 +94,13 @@ export interface ExactChatGrantDeps {
     chatId: string,
     subjectLarkAppIds: string[],
   ): Promise<CurrentChatBotAppResolution>;
-  addChatGrant(larkAppId: string, chatId: string, openId: string): Promise<GrantMutationResult>;
+  addChatGrant(
+    larkAppId: string,
+    chatId: string,
+    openId: string,
+    quota?: number,
+    expiresAt?: number,
+  ): Promise<GrantMutationResult>;
   removeChatGrant(larkAppId: string, chatId: string, openId: string): Promise<RevokeMutationResult>;
   listGrantedOpenIds(larkAppId: string, chatId: string): string[];
 }
@@ -250,10 +268,22 @@ export async function applyExactChatGrant(
     };
   }
 
+  // Optional quota/expiry. The route normalizes the raw option strings; here we
+  // only accept positive finite numbers, so direct callers can never smuggle an
+  // expiry through a crafted type. durationMs is relative — the absolute
+  // expiresAt is anchored once here (before the loop) so a batch shares one
+  // timestamp. undefined on either means "no limit / permanent".
+  const quota = typeof input.quota === 'number' && Number.isFinite(input.quota) && input.quota > 0
+    ? Math.floor(input.quota)
+    : undefined;
+  const expiresAt = typeof input.durationMs === 'number' && Number.isFinite(input.durationMs) && input.durationMs > 0
+    ? Date.now() + Math.floor(input.durationMs)
+    : undefined;
+
   const subjects: ExactChatGrantSubjectResult[] = [];
   for (const subjectOpenId of subjectOpenIds) {
     if (operation === 'grant') {
-      const result = await deps.addChatGrant(input.receiverLarkAppId, chatId, subjectOpenId);
+      const result = await deps.addChatGrant(input.receiverLarkAppId, chatId, subjectOpenId, quota, expiresAt);
       if (!result.ok) {
         return failure(500, 'grant_write_failed', result.reason, { partial: subjects });
       }
@@ -301,13 +331,14 @@ export async function applyExactChatGrantByLarkAppIds(
   input: ExactChatGrantByLarkAppIdsInput,
   deps: ExactChatGrantDeps = defaultDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
-  if (input.operation !== 'grant') {
+  if (input.operation !== 'grant' && input.operation !== 'resolve') {
     return failure(
       400,
       'subject_lark_app_ids_grant_only',
-      'subjectLarkAppIds may only be used with operation=grant',
+      'subjectLarkAppIds may only be used with operation=grant or resolve',
     );
   }
+  const operation = input.operation;
   if (typeof input.chatId !== 'string' || !CHAT_ID_RE.test(input.chatId)) {
     return failure(400, 'invalid_chat_id', 'chatId must be a valid oc_ chat id');
   }
@@ -365,11 +396,27 @@ export async function applyExactChatGrantByLarkAppIds(
     });
   }
   const completeMappings = subjectMappings as CurrentChatBotAppMapping[];
+  if (operation === 'resolve') {
+    return {
+      ok: true,
+      operation: 'resolve',
+      permissionSource: 'chatGrant',
+      talkOnly: true,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: false,
+      grantsOperate: false,
+      subjects: [],
+      subjectMappings: completeMappings,
+    };
+  }
   const result = await applyExactChatGrant({
     operation: 'grant',
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),
+    quota: input.quota,
+    durationMs: input.durationMs,
   }, deps);
   if (!result.ok) return result;
   return { ...result, subjectMappings: completeMappings };

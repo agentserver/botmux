@@ -12,7 +12,7 @@
  * Dedicated lifecycle cases below use a fake child process to cover the real
  * daemon-side detach fence.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -103,6 +103,7 @@ import {
   rollbackRejectedSessionAndGetWinner,
   sendWorkerInput,
   sendWorkerSessionInput,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -113,6 +114,9 @@ import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 import type { Session } from '../src/types.js';
 import {
   __testOnly_resetBotTurnMutationGates,
@@ -211,6 +215,16 @@ describe('transferSession', () => {
     expect(forkWorkerSpy).not.toHaveBeenCalled();
     // Source ds must not have been mutated.
     expect(ds.chatId).toBe('oc_source');
+  });
+
+  it('relay moves the same session and preserves explicit pin provenance', async () => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: 'owner', setAt: '2026-11-06T00:00:00Z' };
+    const pin = structuredClone(ds.session.modelPin);
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    expect((await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_topic', 'group', 'thread')).ok).toBe(true);
+    expect(ds.session.modelPin).toEqual(pin);
+    expect(forkWorkerSpy.mock.calls[0][0].session.modelPin).toEqual(pin);
   });
 
   it('DM flat target (p2p, chat scope): rewrites chatType to p2p and anchors on the DM chatId', async () => {
@@ -513,6 +527,22 @@ describe('transferSession', () => {
     // New scope is 'chat' so anchor is chatId.
     const newKey = sessionKey('oc_target', 'cli_app_test');
     expect(registry.get(newKey)).toBe(ds);
+  });
+
+  it('keeps a validated principal-lane runtime slot while its display target moves', async () => {
+    const runtimeAnchor = 'lane:source:principal-b';
+    const runtimeKey = sessionKey(runtimeAnchor, 'cli_app_test');
+    const ds = makeDs({ runtimeRoutingAnchor: runtimeAnchor });
+    registry.set(runtimeKey, ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result.ok).toBe(true);
+    expect(ds.chatId).toBe('oc_target');
+    expect(ds.scope).toBe('chat');
+    expect(registry.get(runtimeKey)).toBe(ds);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
   });
 
   it('persists session record via sessionStore.updateSession', async () => {
@@ -1158,7 +1188,17 @@ describe('transferSession', () => {
     expect(ds.session.status).toBe('closed');
     expect(registry.has(sourceKey)).toBe(false);
     expect(replacementFork).not.toHaveBeenCalled();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Explicit close freezes the original card; the cancelled transfer must
+    // neither replace it with a relocated card nor publish to the target chat.
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      'om_old_card',
+      expect.any(String),
+      { beforeWrite: expect.any(Function) },
+    );
+    const closedCard = JSON.parse(updateMessageMock.mock.calls[0][2]);
+    expect(closedCard.header.title.content).toContain('会话已关闭');
   });
 
   it('keeps a committed transfer successful when replacement fork and replay throw', async () => {
@@ -2293,7 +2333,8 @@ describe('closeSession concurrency', () => {
       { fileToken: 'doc-token', fileType: 'docx' },
       'comment-1',
       'reply-1',
-      'reaction-1',
+      'Typing',
+      { identity: undefined },
     );
   });
 
@@ -2319,6 +2360,33 @@ describe('closeSession concurrency', () => {
     expect(sessionStore.updateSession).toHaveBeenCalledWith(stored);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
     expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans a pre-upgrade closed target that has replyId but no reaction metadata', async () => {
+    setActiveSessionsRegistry(new Map());
+    const stored = makeDs().session;
+    stored.status = 'closed';
+    stored.docCommentTargets = {
+      'turn-legacy': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-legacy',
+        replyId: 'reply-1',
+      },
+    };
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(stored);
+
+    await closeSession(stored.sessionId);
+
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      { fileToken: 'doc-token', fileType: 'docx' },
+      'comment-1',
+      'reply-1',
+      'Typing',
+      { identity: undefined },
+    );
   });
 
   it('does not treat another bot file found by read-only lookup as owned close state', async () => {

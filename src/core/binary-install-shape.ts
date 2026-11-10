@@ -25,7 +25,9 @@ import { isStandaloneBinary } from './self-spawn.js';
  *                     (`botmux-<plat>-<arch>[-musl]`). The manager owns the file;
  *                     update by re-running it.
  *  · `curl-binary`  — the standalone location install.sh writes. We own the file;
- *                     update by replacing it.
+ *                     update by replacing it. Botmux.app's runtime copy
+ *                     (`~/.botmux/app-runtime/botmux`, see appRuntimeBinaryPath)
+ *                     has the same ownership, so it shares this shape.
  *  · `unknown`      — anywhere else (a hand-copied binary, a distro package, a dev
  *                     build run straight out of dist-bin/), or not a compiled
  *                     binary at all. Fail closed.
@@ -35,6 +37,17 @@ export type BinaryInstallShape = 'npm-binary' | 'curl-binary' | 'unknown';
 /** Default standalone install dir, matching install.sh's own default. */
 function defaultInstallDir(home: string): string {
   return join(home, '.botmux', 'bin');
+}
+
+/**
+ * Where Botmux.app keeps the botmux binary it runs. The app seeds it from its
+ * bundle and then treats it exactly like an install.sh binary: replaced in place
+ * by `botmux update` / maintenance, never by rewriting files inside the signed
+ * .app. Living outside the bundle also keeps the fleet (and launchd/wrapper paths
+ * that point at it) intact when the app is moved or reinstalled.
+ */
+export function appRuntimeBinaryPath(home: string = homedir()): string {
+  return join(home, '.botmux', 'app-runtime', 'botmux');
 }
 
 /** Strip Windows separators and any trailing slashes so two paths naming the same
@@ -107,15 +120,13 @@ export function classifyBinaryInstall(
   // honours, so an install that used it is recognised WHEN THAT VARIABLE IS STILL
   // EXPORTED at runtime. ⚠️ It usually is not: `BOTMUX_INSTALL_DIR=/opt/bm sh
   // install.sh` sets it for the installer only, so a later `botmux update` sees a
-  // bare environment and this falls through to `unknown` — fail-closed, so nothing
-  // is damaged, but self-update is unavailable for that install. Do not describe
-  // custom dirs as unconditionally covered; making them work without the variable
-  // would need a persisted install record, which is out of scope here.
+  // bare environment and this falls through to `unknown`. A manual update then
+  // installs the release at the default launcher path, preserving this binary.
   //
   // Compared BOTH raw and canonicalized (see {@link canonical}): a symlinked home
   // makes the raw strings differ for one and the same file.
   const pathResolved = resolve(path);
-  for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home)]) {
+  for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home), join(home, '.botmux', 'app-runtime')]) {
     if (!raw) continue;
     const dir = normalizeSlashes(raw);
     if (!dir) continue;
@@ -196,12 +207,14 @@ export function mainPackageRootForSubpackageBinary(execPath: string): string | n
  *    plain Node install AND a compiled binary living inside a package manager's
  *    tree (the manager owns that file).
  *  · `self-replace`    — download the release asset and swap the binary.
+ *  · `install-release` — manually install a release at the default launcher path.
  *  · `unsupported`     — could not identify the install; callers keep their
  *                        existing "unsupported install" behaviour.
  */
 export type UpdateStrategy =
   | { kind: 'package-manager'; packageRoot: string }
   | { kind: 'self-replace'; target: string }
+  | { kind: 'install-release'; target: string }
   | { kind: 'unsupported'; reason: 'unknown-binary-location' };
 
 /**
@@ -234,7 +247,7 @@ export function resolveUpdateStrategy(
     if (root) return { kind: 'package-manager', packageRoot: root };
   }
   if (shape === 'curl-binary') return { kind: 'self-replace', target: execPath };
-  return { kind: 'unsupported', reason: 'unknown-binary-location' };
+  return { kind: 'install-release', target: join(defaultInstallDir(home), 'botmux') };
 }
 
 /** Production wiring for {@link resolveUpdateStrategy}. */

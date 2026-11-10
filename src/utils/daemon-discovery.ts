@@ -11,18 +11,38 @@
  * the last DAEMON_HEARTBEAT_STALE_MS (utils/daemon-heartbeat.ts — shared with
  * dashboard/registry.ts and the session-store occupancy lease TTL).
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
+import { parseLarkConnectionHealth, type LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 
 export interface OnlineDaemonInfo {
+  larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   ipcPort: number;
   /** Random per-process audience for authenticated Workflow v3 mutations. */
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with bootInstanceId + ipcPort. */
   workflowIpcProtocol?: string;
+  /** Internal target-authoritative dispatch launch protocol. */
+  dispatchLaunchIpcProtocol?: 'v1';
+  /** Applies a workflow run's Gate-2 working dir to its node sessions
+   *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
+  workflowNodeWorkingDir?: 'v1';
+  /** Reads a run.json carrying the launching draft's project and starts a
+   *  node of a bot without a default working dir there (§15.4). Absent = an
+   *  older daemon, which rejects such a run.json: the project is not
+   *  written for a run it executes. */
+  workflowNodeProjectDir?: 'v1';
+  /** Handles a workflow handoff in the run's main topic (design 2026-11-03
+   *  §5.5: queued as its own turn, attempt-scoped session marker). Absent =
+   *  an older daemon, which gets node-topic handoffs only. */
+  workflowMainPlacement?: 'v1';
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   botName?: string;
   cliId?: string;
   pid?: number;
@@ -61,13 +81,20 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+/** `strict`: an unlistable registry dir throws instead of reading as "nobody
+ *  online" — for callers that must not mistake an unreadable registry for an
+ *  empty one. Malformed individual descriptors are skipped either way. */
+export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } = {}): OnlineDaemonInfo[] {
   const dir = registryDir(dataDir);
-  if (!existsSync(dir)) return [];
+  // No existsSync pre-check: it also answers false on EACCES, which strict
+  // mode must surface. A registry that was never created (ENOENT) is empty.
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
   let names: string[] = [];
-  try { names = readdirSync(dir); } catch { return []; }
+  try { names = readdirSync(dir); } catch (err) {
+    if (opts.strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return [];
+  }
   for (const f of names) {
     if (!f.endsWith('.json')) continue;
     try {
@@ -75,7 +102,9 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
       const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
       if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
       if (now - (d.lastHeartbeat ?? 0) > DAEMON_HEARTBEAT_STALE_MS) continue;
+      const larkConnection = parseLarkConnectionHealth(d.larkConnection);
       out.push({
+        ...(larkConnection !== undefined ? { larkConnection } : {}),
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
         ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
@@ -83,6 +112,18 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
           : {}),
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
+          : {}),
+        ...(d.dispatchLaunchIpcProtocol === 'v1'
+          ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
+          : {}),
+        ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
+        ...(d.workflowNodeProjectDir === 'v1' ? { workflowNodeProjectDir: d.workflowNodeProjectDir } : {}),
+        ...(d.workflowMainPlacement === 'v1' ? { workflowMainPlacement: d.workflowMainPlacement } : {}),
+        ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
+          ? { sessionStoreProtocol: d.sessionStoreProtocol }
+          : {}),
+        ...(typeof d.botmuxVersion === 'string' && d.botmuxVersion
+          ? { botmuxVersion: d.botmuxVersion }
           : {}),
         ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),

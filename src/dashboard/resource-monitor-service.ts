@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { DaemonInfo } from './registry.js';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import {
@@ -9,7 +10,7 @@ import {
   type ResourceDaemonSeed,
   type ResourceSessionSeed,
 } from '../core/resource-monitor/attribution.js';
-import { sampleProcfs as defaultSampleProcfs } from '../core/resource-monitor/procfs.js';
+import { sampleProcfsAsync as defaultSampleProcfs, unsupportedSample, type ProcfsSampleOptions } from '../core/resource-monitor/procfs.js';
 import { NumericRingSeries } from '../core/resource-monitor/ring-buffer.js';
 import { buildRuntimeMonitorSummary } from '../core/resource-monitor/runtime.js';
 import { selectTrackedSessions } from '../core/resource-monitor/top-selector.js';
@@ -34,7 +35,14 @@ export interface ResourceMonitorDeps {
   listSessions: () => ResourceSessionSeed[];
   listDaemons: () => ResourceDaemonSeed[];
   listBotmuxPids?: () => number[];
-  sampleProcfs?: (nowMs: number) => ProcfsSample;
+  /**
+   * Process-table sampler. May be synchronous (tests, one-shot tools) or return a
+   * promise (the production default, `sampleProcfsAsync`, which keeps the event
+   * loop free while /proc is swept). `opts.pssRoots` carries the pids attribution
+   * will actually sum (daemons, workers, CLI markers, adopted CLIs) so the sampler
+   * can confine the expensive PSS read to those subtrees.
+   */
+  sampleProcfs?: (nowMs: number, opts: ProcfsSampleOptions) => ProcfsSample | Promise<ProcfsSample>;
   readCliMarkers?: () => Map<number, CliMarkerInfo>;
   nowMs?: () => number;
 }
@@ -42,7 +50,13 @@ export interface ResourceMonitorDeps {
 export interface ResourceMonitorService {
   start(): void;
   stop(): void;
-  sampleOnce(): void;
+  /**
+   * Take one sample and fold it into `current()`/history. Synchronous when the
+   * configured sampler is synchronous; otherwise resolves once the snapshot has
+   * been applied. Overlapping async samples are coalesced: a tick that fires while
+   * the previous sweep is still in flight is skipped rather than queued.
+   */
+  sampleOnce(): void | Promise<void>;
   current(): ResourceCurrentSnapshot;
   history(range: '1h' | '3h' | '24h'): ResourceHistorySnapshot;
 }
@@ -119,6 +133,8 @@ function nonEmptyString(value: unknown): string | undefined {
 export function buildResourceMonitorDaemonSeeds(
   configs: ResourceMonitorBotConfigRow[],
   onlineRows: ResourceMonitorDashboardDaemonRow[],
+  /** Unified appId → display name (services/bot-display-name.ts); wins when it has a name. */
+  nameOf?: (larkAppId: string) => string | undefined,
 ): ResourceDaemonSeed[] {
   const onlineByAppId = new Map<string, ResourceMonitorDashboardDaemonRow>();
   for (const row of onlineRows) {
@@ -132,7 +148,8 @@ export function buildResourceMonitorDaemonSeeds(
     const online = onlineByAppId.get(larkAppId);
     return [toResourceMonitorDaemonSeed({
       larkAppId,
-      botName: nonEmptyString(online?.botName)
+      botName: nonEmptyString(nameOf?.(larkAppId))
+        ?? nonEmptyString(online?.botName)
         ?? nonEmptyString(cfg.displayName)
         ?? nonEmptyString(cfg.name)
         ?? larkAppId,
@@ -155,9 +172,15 @@ export async function handleResourceMonitorApi(
   res: ServerResponse,
   url: URL,
   service: ResourceMonitorService,
+  listOnline: () => Pick<DaemonInfo, 'larkAppId' | 'botName' | 'larkConnection'>[] = () => [],
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/resources/current') {
-    json(res, 200, service.current());
+    // Transport health comes from daemon heartbeats, even on hosts without a
+    // process sampler. Project only operator-visible fields from the descriptor.
+    const larkConnections = listOnline().map(({ larkAppId, botName, larkConnection }) => ({
+      larkAppId, botName, larkConnection,
+    }));
+    json(res, 200, { ...service.current(), larkConnections });
     return true;
   }
   if (req.method === 'GET' && url.pathname === '/api/resources/history') {
@@ -306,6 +329,15 @@ export function readCliPidMarkers(dataDir = config.session.dataDir): Map<number,
   return out;
 }
 
+/** Everything attribution will look at, captured once per sample (the seed
+ *  callbacks re-read registries / parse config, so call them once, not thrice). */
+interface SampleSeeds {
+  sessions: ResourceSessionSeed[];
+  daemons: ResourceDaemonSeed[];
+  botmuxPids: number[];
+  cliMarkers: Map<number, CliMarkerInfo>;
+}
+
 export function createResourceMonitorService(deps: ResourceMonitorDeps): ResourceMonitorService {
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
   const topSessionLimit = deps.topSessionLimit ?? DEFAULT_TOP_SESSION_LIMIT;
@@ -389,18 +421,18 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     }
   }
 
-  function runtimeSummaryFromSeeds(supported: boolean, sampledAt: number, now: number): RuntimeMonitorSummary {
+  function runtimeSummaryFromSeeds(supported: boolean, sampledAt: number, now: number, seeds: SampleSeeds): RuntimeMonitorSummary {
     return buildRuntimeMonitorSummary({
       supported,
       sampledAt,
       intervalMs,
       nowMs: now,
-      bots: deps.listDaemons().map(daemon => ({
+      bots: seeds.daemons.map(daemon => ({
         larkAppId: daemon.larkAppId,
         botName: daemon.botName ?? daemon.larkAppId,
         daemonStatus: daemon.status ?? (daemon.pid ? 'unknown' : 'offline'),
       })),
-      sessions: deps.listSessions().map(session => ({
+      sessions: seeds.sessions.map(session => ({
         sessionId: session.sessionId,
         larkAppId: session.larkAppId,
         botName: session.botName ?? session.larkAppId,
@@ -414,14 +446,57 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     });
   }
 
-  function sampleOnce(): void {
+  function collectSeeds(): SampleSeeds {
+    return {
+      sessions: deps.listSessions(),
+      daemons: deps.listDaemons(),
+      botmuxPids: listBotmuxPids(),
+      cliMarkers: readCliMarkers(),
+    };
+  }
+
+  /** Roots of every subtree attribution sums memory for — the only pids worth a
+   *  PSS read (see ProcfsSampleOptions.pssRoots). */
+  function pssRootsFrom(seeds: SampleSeeds): number[] {
+    const roots = new Set<number>(seeds.botmuxPids);
+    for (const daemon of seeds.daemons) if (daemon.pid) roots.add(daemon.pid);
+    for (const session of seeds.sessions) {
+      if (session.workerPid) roots.add(session.workerPid);
+      if (session.adoptCliPid) roots.add(session.adoptCliPid);
+    }
+    for (const pid of seeds.cliMarkers.keys()) roots.add(pid);
+    return [...roots];
+  }
+
+  let inFlight = false;
+
+  function sampleOnce(): void | Promise<void> {
+    if (inFlight) return; // previous async sweep still running — skip this tick, don't pile up
     const now = nowMs();
-    const sample = sampleProcfs(now);
+    const seeds = collectSeeds();
+    const result = sampleProcfs(now, { pssRoots: pssRootsFrom(seeds) });
+    if (result && typeof (result as PromiseLike<ProcfsSample>).then === 'function') {
+      inFlight = true;
+      return Promise.resolve(result)
+        .then((sample) => applySample(sample, now, seeds))
+        // The async sampler already degrades its own errors to an unsupported
+        // snapshot; a rejection here is a bug. It still must not become an
+        // unhandled rejection in the dashboard process, nor freeze the monitor on
+        // a stale "fresh" sample — degrade to unsupported like the sync path does.
+        .catch(() => {
+          try { applySample(unsupportedSample(now), now, seeds); } catch { /* keep the loop alive */ }
+        })
+        .finally(() => { inFlight = false; });
+    }
+    applySample(result as ProcfsSample, now, seeds);
+  }
+
+  function applySample(sample: ProcfsSample, now: number, seeds: SampleSeeds): void {
     if (!sample.supported) {
       const sampledAt = sample.sampledAt || now;
       currentSnapshot = {
         ...emptyCurrent(sampledAt, intervalMs),
-        runtime: runtimeSummaryFromSeeds(false, sampledAt, now),
+        runtime: runtimeSummaryFromSeeds(false, sampledAt, now, seeds),
       };
       previousTotalCpuTicks = undefined;
       previousIdleCpuTicks = undefined;
@@ -440,10 +515,10 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     const attribution = attributeResources({
       processes: sample.processes,
       processCpuPct: cpuByPid,
-      sessions: deps.listSessions(),
-      daemons: deps.listDaemons(),
-      botmuxPids: listBotmuxPids(),
-      cliMarkers: readCliMarkers(),
+      sessions: seeds.sessions,
+      daemons: seeds.daemons,
+      botmuxPids: seeds.botmuxPids,
+      cliMarkers: seeds.cliMarkers,
       previousSessionStats,
       nowMs: now,
     });
@@ -538,8 +613,10 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
   return {
     start() {
       if (timer) return;
-      sampleOnce();
-      timer = setInterval(sampleOnce, intervalMs);
+      // sampleOnce() handles its own rejection (see the async branch), so the
+      // returned promise — if any — can be dropped here and in the interval.
+      void sampleOnce();
+      timer = setInterval(() => { void sampleOnce(); }, intervalMs);
       timer.unref?.();
     },
     stop() {

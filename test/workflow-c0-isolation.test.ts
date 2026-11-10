@@ -183,6 +183,24 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).not.toMatch(/refused inside workflow/);
   });
 
+  // botmux installs local Claude-family hook clients into
+  // ~/.claude/settings.json — session-ready (SessionStart), hook (generic),
+  // user-prompt-hook (UserPromptSubmit) and __claude-compaction-v1 (PreCompact).
+  // They fire from inside a workflow subagent's own CLI, so all must be on the
+  // read-only allowlist; user-prompt-hook in particular fires on EVERY prompt,
+  // and if the fence rejects it Claude reports the whole prompt "blocked by
+  // hook" and `/goal` never lands (Bug 4). A refused PreCompact hook exits 2,
+  // which blocks compaction.
+  it.each([
+    ['session-ready'],
+    ['hook'],
+    ['user-prompt-hook'],
+    ['__claude-compaction-v1'],
+  ])('botmux %s (botmux-installed hook client) is allowed in workflow mode', (cmd) => {
+    const out = runCli([cmd], { BOTMUX_WORKFLOW: '1' });
+    expect(out.stderr).not.toMatch(/refused inside workflow/);
+  });
+
   it('outside workflow mode (BOTMUX_WORKFLOW unset), send proceeds to its own logic', () => {
     // Without BOTMUX_WORKFLOW=1 the gate doesn't trigger.  The command
     // will still fail (no session in this test env) but with the normal

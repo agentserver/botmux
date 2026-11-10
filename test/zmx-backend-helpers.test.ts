@@ -14,7 +14,7 @@ vi.mock('node:child_process', () => {
   };
 });
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   buildFreshAttachArgs,
   buildZmxLaunchFiles,
@@ -29,10 +29,14 @@ import {
 } from '../src/adapters/backend/zmx-backend.js';
 import {
   parseZmxVersion,
+  parseZmxSocketDir,
+  resolveZmxSocketDir,
   probeZmxFunctional,
   probeZmxVersion,
   zmxEnv,
 } from '../src/setup/ensure-zmx.js';
+
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
 
 const execFileSyncMock = vi.mocked(execFileSync);
 const tempDirs: string[] = [];
@@ -117,6 +121,126 @@ function waitForExit(
 }
 
 describe('zmx env/probe helpers', () => {
+  it.each([false, true])('finds host zmx after stripping an injected CLI PATH (strictEnv=%s)', (strictEnv) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zmx-path-'));
+    tempDirs.push(root);
+    const hostBin = join(root, 'host');
+    const sessionBin = join(root, 'session');
+    for (const [dir, output] of [[hostBin, 'host-zmx'], [sessionBin, 'session-zmx']]) {
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'zmx'), `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o755 });
+    }
+    vi.stubEnv('PATH', hostBin);
+    const cliPath = `${sessionBin}:${hostBin}`;
+    const opts = {
+      cwd: root, cols: 80, rows: 24, strictEnv,
+      env: { PATH: cliPath, BOTMUX_SESSION_ID: 'session-secret' },
+      injectEnv: { PATH: cliPath, API_TOKEN: 'payload-secret' },
+    };
+    const env = zmxControlEnv(opts);
+    const result = spawnSync('zmx', ['version'], { env, encoding: 'utf8' });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe('host-zmx');
+    // Same lookup as the availability probe, so a host with two zmx installs
+    // drives the one that passed the probe.
+    expect(env.PATH).toBe(zmxEnv().PATH);
+    const pathEntries = env.PATH?.split(':') ?? [];
+    expect(pathEntries).toContain(hostBin);
+    expect(pathEntries).toEqual(expect.arrayContaining(['/usr/bin', '/bin']));
+    expect(pathEntries).not.toContain(sessionBin);
+    expect(env.API_TOKEN).toBeUndefined();
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(opts.env.PATH).toBe(cliPath);
+    expect(zmxFreshSessionEnv(opts).PATH).toBe(env.PATH);
+  });
+
+  it('builds the same control env as before when no PATH is injected', () => {
+    vi.stubEnv('PATH', '/worker/only/bin');
+    const searchPath = (path?: string) => zmxEnv(path === undefined ? {} : { PATH: path }).PATH;
+    const sessionEnv = {
+      PATH: '/session/bin:/usr/bin',
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      HTTPS_PROXY: 'http://proxy.invalid:3128',
+      BOTMUX_SESSION_ID: 'session-secret',
+      ZMX_SESSION: 'outer',
+      ZMX_SESSION_PREFIX: 'dev-',
+      ZMX_DIR: '/tmp/caller-zmx',
+    };
+    const opts = {
+      cwd: '/tmp', cols: 80, rows: 24, env: sessionEnv,
+      injectEnv: { API_TOKEN: 'payload-secret', ZMX_DIR: '/tmp/payload-zmx' },
+    };
+
+    expect(zmxControlEnv(opts, '/tmp/recorded-zmx')).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      ZMX_DIR: '/tmp/recorded-zmx',
+    });
+    expect(zmxControlEnv({ ...opts, injectEnv: undefined })).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      ZMX_DIR: '/tmp/caller-zmx',
+    });
+    expect(zmxControlEnv({ ...opts, strictEnv: true }, '/tmp/recorded-zmx')).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      ZMX_DIR: '/tmp/recorded-zmx',
+    });
+    // Without an injected PATH the worker PATH never leaks in, even when the
+    // session env has no PATH of its own.
+    const { PATH: _sessionPath, ...sessionEnvWithoutPath } = sessionEnv;
+    expect(zmxControlEnv({ ...opts, env: sessionEnvWithoutPath }).PATH).toBe(searchPath(undefined));
+  });
+
+  it('records the native socket directory once and preserves it across selection in another environment', () => {
+    execFileSyncMock.mockReturnValue('zmx\t\t0.7.1\nsocket_dir\t/tmp/created zmx\n' as never);
+    const first = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: false,
+    });
+    expect(first.persistentBackendTarget).toEqual({
+      backendType: 'zmx', sessionName: 'bmx-abcdef12', socketDir: '/tmp/created zmx',
+    });
+    vi.stubEnv('ZMX_DIR', '/tmp/other-zmx');
+    const resumed = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: true,
+      persistentBackendTarget: first.persistentBackendTarget,
+    });
+    expect(resumed.persistentBackendTarget).toEqual(first.persistentBackendTarget);
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses new targets when zmx does not report an absolute socket directory', () => {
+    expect(parseZmxSocketDir('socket_dir\t/tmp/zmx with spaces\n')).toBe('/tmp/zmx with spaces');
+    for (const output of ['zmx 0.7.1', 'zmx 0.7.1\nsocket_dir relative', 'zmx 0.7.1\nsocket_dir /tmp/bad\0dir']) {
+      execFileSyncMock.mockReturnValue(output as never);
+      expect(() => resolveZmxSocketDir()).toThrow(/socket_dir/);
+    }
+  });
+
+  it('applies the stored socket address after payload stripping without changing TMPDIR', () => {
+    const opts = {
+      cwd: '/tmp', cols: 80, rows: 24,
+      env: { TMPDIR: '/tmp/caller', TMP: '/tmp/caller', TEMP: '/tmp/caller', ZMX_DIR: '/tmp/caller-zmx', ZMX_SESSION: 'outer' },
+      injectEnv: { ZMX_DIR: '/tmp/payload-zmx' },
+    };
+    const env = zmxControlEnv(opts, '/tmp/recorded-zmx');
+    expect(env.ZMX_DIR).toBe('/tmp/recorded-zmx');
+    expect(env.TMPDIR).toBe('/tmp/caller');
+    expect(env.TMP).toBe('/tmp/caller');
+    expect(env.TEMP).toBe('/tmp/caller');
+    expect(env.ZMX_SESSION).toBeUndefined();
+    expect(opts.env.ZMX_DIR).toBe('/tmp/caller-zmx');
+    expect(zmxFreshSessionEnv(opts, '/tmp/recorded-zmx').ZMX_DIR).toBe('/tmp/recorded-zmx');
+  });
+
   it('strips inherited session vars but preserves the socket dir', () => {
     const env = zmxEnv({
       PATH: '/bin',
@@ -525,13 +649,8 @@ describe('zmx backend pure helpers', () => {
     // other backend PTY already forces — deterministic, invoker-independent.
     expect(zmxFreshSessionEnv({ ...opts, env: { PATH: '/bin', TERM: 'xterm-ghostty' } }).TERM)
       .toBe('xterm-256color');
-    // Source pin: only the one-shot create client (whose env becomes the
-    // session env) spawns with the pinned env; control clients (get/set/
-    // list/kill) keep the unpinned zmxControlEnv.
-    const src = readFileSync(new URL('../src/adapters/backend/zmx-backend.ts', import.meta.url), 'utf-8');
-    const spawnAt = src.indexOf("spawnSync('zmx', buildFreshAttachArgs(");
-    expect(spawnAt).toBeGreaterThan(-1);
-    expect(src.slice(spawnAt, src.indexOf('});', spawnAt))).toContain('env: zmxFreshSessionEnv(opts)');
+    // That only the create client spawns with this env (control clients keep
+    // zmxControlEnv) is covered behaviorally in zmx-backend-recovery.test.ts.
   });
 
   it('keeps the POSIX ZMX payload path sourced through the user shell with the argv sentinel', () => {

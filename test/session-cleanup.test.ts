@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS,
   cleanupIdleSessions,
   idleCleanupCutoffMs,
+  isDormantCleanupCandidate,
   parseIdleCleanupHours,
+  selectCleanupCandidates,
   selectIdleCleanupCandidates,
 } from '../src/dashboard/session-cleanup.js';
+import { SESSION_CLEANUP_HOUR_OPTIONS } from '../src/global-config.js';
 
 const NOW = Date.UTC(2026, 5, 22, 12, 0, 0);
 const hour = 60 * 60 * 1000;
@@ -21,7 +25,17 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 
 describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
-    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([24, 72, 168]);
+    expect(AUTO_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
+    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([1, 24, 72, 168, 0]);
+    // Lock the option table to the parser: a new option added without updating
+    // the string whitelist must not silently parse to null in the UI.
+    for (const hours of IDLE_CLEANUP_HOUR_OPTIONS) {
+      expect(parseIdleCleanupHours(hours)).toBe(hours);
+    }
+    expect(parseIdleCleanupHours(1)).toBe(1);
+    expect(parseIdleCleanupHours('1')).toBe(1);
+    expect(parseIdleCleanupHours(0)).toBe(0);
+    expect(parseIdleCleanupHours('all')).toBe(0);
     expect(parseIdleCleanupHours(24)).toBe(24);
     expect(parseIdleCleanupHours('72')).toBe(72);
     expect(parseIdleCleanupHours('7d')).toBe(168);
@@ -30,6 +44,49 @@ describe('dashboard idle session cleanup selection', () => {
     expect(parseIdleCleanupHours(12)).toBeNull();
     expect(parseIdleCleanupHours('24h')).toBeNull();
     expect(parseIdleCleanupHours('bad')).toBeNull();
+    for (const invalid of [undefined, null, false, true, '', ' ', [], {}, -1]) {
+      expect(parseIdleCleanupHours(invalid)).toBeNull();
+    }
+  });
+  it('selects only sessions idle for more than one hour', () => {
+    expect(selectIdleCleanupCandidates([
+      row('older', { lastMessageAt: NOW - 2 * hour }),
+      row('boundary', { lastMessageAt: NOW - hour }),
+      row('recent', { lastMessageAt: NOW - hour / 2 }),
+    ], 1, NOW).map(s => s.sessionId)).toEqual(['older']);
+  });
+  it('all removes only the age filter, preserving idle and dormant protections', async () => {
+    const rows = [
+      row('recent', { lastMessageAt: NOW }),
+      row('unknown-time', { lastMessageAt: undefined }),
+      row('dormant', { status: 'dormant', lastMessageAt: undefined }),
+      row('queued-fresh', { queued: true, lastMessageAt: NOW }),
+      row('working', { status: 'working' }),
+      row('starting', { status: 'starting' }),
+      row('closed', { status: 'closed' }),
+      row('locked', { locked: true }),
+      row('repo', { pendingRepo: true }),
+      row('prompt', { tuiPromptActive: true }),
+      row('attention', { agentAttention: { kind: 'blocked' } }),
+      row('served-dormant', { status: 'dormant', webPort: 1234 }),
+    ];
+    const closed: string[] = [];
+    const result = await cleanupIdleSessions(rows, 0, async s => {
+      closed.push(s.sessionId); return { sessionId: s.sessionId, ok: true };
+    }, NOW);
+    expect(closed).toEqual(['recent', 'unknown-time', 'dormant']);
+    expect(result.matched).toBe(3); expect(result.olderThanHours).toBe(0);
+  });
+
+  it('never sweeps queued backlog rows at any threshold', () => {
+    // dashboard-rows projects queued sessions as status 'idle'; their parked
+    // queuedPrompt draft must keep them out of every sweep, including 1H and
+    // the age-less 0 / "all" mode.
+    const parked = row('queued-old', { queued: true, lastMessageAt: NOW - 30 * 24 * hour });
+    expect(selectIdleCleanupCandidates([parked], 0, NOW)).toEqual([]);
+    expect(selectIdleCleanupCandidates([parked], 1, NOW)).toEqual([]);
+    expect(selectIdleCleanupCandidates([parked], 24, NOW)).toEqual([]);
+    expect(selectCleanupCandidates([parked], 0, NOW)).toEqual({ idle: [], dormant: [] });
   });
 
   it('selects idle sessions older than the threshold and skips unsafe statuses', () => {
@@ -80,6 +137,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 1,
       failed: 1,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'old-idle', ok: true },
         { sessionId: 'fails', ok: false, error: 'close_failed' },
@@ -124,6 +182,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 2,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'a', ok: true },
         { sessionId: 'b', ok: true },
@@ -143,11 +202,10 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 0,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [],
     });
   });
-
-
   it('counts a residual close separately from a clean one', () => {
     // An idle/workerless mojo row can carry a parked lineage, so this path really
     // does produce residuals. Folding them into `closed` reports "closed N,
@@ -169,6 +227,69 @@ describe('dashboard idle session cleanup selection', () => {
       expect(r.closed).toBe(2);
       expect(r.failed).toBe(0);
       expect(r.residual).toBe(1);
+    });
+  });
+
+  describe('dormant (workerless) cleanup candidates', () => {
+    const dormant = (id: string, patch: Record<string, unknown> = {}) =>
+      row(id, { status: 'dormant', lastMessageAt: NOW - 48 * hour, ...patch });
+
+    it('selects a dormant row older than the threshold with no terminal port', () => {
+      expect(isDormantCleanupCandidate(dormant('old-dormant'), 24, NOW)).toBe(true);
+    });
+
+    it('rejects a dormant row newer than the threshold', () => {
+      expect(isDormantCleanupCandidate(dormant('new-dormant', { lastMessageAt: NOW - 2 * hour }), 24, NOW)).toBe(false);
+    });
+
+    it('rejects a dormant row that still advertises a live terminal port', () => {
+      expect(isDormantCleanupCandidate(dormant('with-port', { webPort: 41235 }), 24, NOW)).toBe(false);
+    });
+
+    it('rejects dormant rows that are locked or carry pending work / attention', () => {
+      expect(isDormantCleanupCandidate(dormant('locked', { locked: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(dormant('pending-repo', { pendingRepo: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(dormant('tui-prompt', { tuiPromptActive: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(
+        dormant('agent-attention', { agentAttention: { kind: 'blocked', reason: 'needs input', at: NOW - 48 * hour } }),
+        24, NOW,
+      )).toBe(false);
+    });
+
+    it('splits idle and dormant rows in the categorized selector', () => {
+      const selected = selectCleanupCandidates([
+        row('old-idle'),
+        dormant('old-dormant'),
+        row('new-idle', { lastMessageAt: NOW - 2 * hour }),
+        dormant('dormant-with-port', { webPort: 41235 }),
+        row('working', { status: 'working', lastMessageAt: NOW - 48 * hour }),
+      ], 24, NOW);
+
+      expect(selected.idle.map(s => s.sessionId)).toEqual(['old-idle']);
+      expect(selected.dormant.map(s => s.sessionId)).toEqual(['old-dormant']);
+    });
+
+    it('closes the union of idle and dormant candidates row by row', async () => {
+      const closed: string[] = [];
+      const result = await cleanupIdleSessions([
+        row('old-idle'),
+        dormant('old-dormant'),
+        dormant('dormant-fails'),
+        dormant('dormant-with-port', { webPort: 41235 }),
+        row('working', { status: 'working', lastMessageAt: NOW - 48 * hour }),
+      ], 24, async (candidate) => {
+        if (candidate.sessionId === 'dormant-fails') {
+          return { sessionId: candidate.sessionId, ok: false, error: 'close_failed' };
+        }
+        closed.push(candidate.sessionId);
+        return { sessionId: candidate.sessionId, ok: true };
+      }, NOW);
+
+      expect(closed).toEqual(['old-idle', 'old-dormant']);
+      expect(result.matched).toBe(3);
+      expect(result.closed).toBe(2);
+      expect(result.failed).toBe(1);
+      expect(result.results.map(r => r.sessionId)).toEqual(['old-idle', 'old-dormant', 'dormant-fails']);
     });
   });
 });

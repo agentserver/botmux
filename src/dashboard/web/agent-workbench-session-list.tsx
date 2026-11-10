@@ -19,6 +19,8 @@ import {
   workbenchListItemHeight,
   workbenchSessionKind,
   workbenchSessionTitle,
+  workbenchWorkspaceBucket,
+  workbenchWorkspaceDetail,
   type WorkbenchGroupDimension,
   type WorkbenchListItem,
   type WorkbenchSessionGroup,
@@ -31,7 +33,7 @@ import {
   type WorkbenchStorage,
 } from './agent-workbench-storage.js';
 import { buildChatAppLink } from './agent-workbench-chat.js';
-import { t } from './ui.js';
+import { botDisplayName, t } from './ui.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
@@ -201,7 +203,9 @@ function sessionOptionId(sessionId: string): string {
 }
 
 function sessionSecondary(session: WorkbenchSessionRow): string {
-  return [session.botName, session.cliId, session.repoName].filter(Boolean).join(' · ') || session.sessionId;
+  // Bot 名按 larkAppId 现查（会话行里的 botName 是快照，可能是改名前的旧名）。
+  const bot = session.botName || session.larkAppId ? botDisplayName(session) : '';
+  return [bot, session.cliId, session.repoName].filter(Boolean).join(' · ') || session.sessionId;
 }
 
 /** Mirrors the 620px breakpoint the stylesheet uses for taller touch rows, so
@@ -441,6 +445,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
           <button type="button" aria-label="收起会话列表" title="收起会话列表" onClick={props.onToggleCollapsed}>«</button>
         ) : null}
       </div>
+      {dimension === 'worktree' && <p className="wb-worktree-hint">待处理会话在上方单独展示；未识别工作区不跨会话合并。</p>}
       <label className="wb-session-search">
         <span className="wb-visually-hidden">搜索会话</span>
         <span aria-hidden="true">⌕</span>
@@ -482,7 +487,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                   className={`${headerClassName(item)} wb-session-group-toggle`}
                   style={style}
                   aria-expanded={!groupCollapsed}
-                  title={groupCollapsed ? `展开「${item.label}」` : `折叠「${item.label}」`}
+                  title={item.detail || (groupCollapsed ? `展开「${item.label}」` : `折叠「${item.label}」`)}
                   onClick={() => toggleGroup(item.groupKey)}
                 >
                   <span className="wb-session-group-caret" aria-hidden="true">{groupCollapsed ? '▸' : '▾'}</span>
@@ -503,6 +508,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
             const chatHref = session.feishuChatLink
               || (session.chatId ? buildChatAppLink(session.chatId) : null);
             const kind = workbenchSessionKind(session);
+            // 类型徽标保留单聊；话题操作只取决于会话范围，不取决于聊天类型。
+            const isThread = session.scope === 'thread';
             return (
                 <div
                   key={item.key}
@@ -526,7 +533,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                               {KIND_COPY[kind].label}
                             </span>
                           ) : null}
-                          {reason ? <span className="wb-session-reason">{reason}</span> : <span>{sessionSecondary(session)}</span>}
+                          {reason ? <span className="wb-session-reason" title={dimension === 'worktree' ? workbenchWorkspaceDetail(session) : undefined}>{dimension === 'worktree' ? `${workbenchWorkspaceBucket(session).label} · ${reason}` : reason}</span> : <span title={dimension === 'worktree' ? workbenchWorkspaceDetail(session) : undefined}>{dimension === 'worktree' ? `${sessionSecondary(session)} · ${workbenchWorkspaceBucket(session).label}` : sessionSecondary(session)}</span>}
                           {unread ? <span className="wb-unread-dot" role="img" aria-label={UNREAD_REASON} /> : null}
                           <time dateTime={new Date(sessionActivityAt(session)).toISOString()}>
                             {formatWorkbenchRelativeTime(sessionActivityAt(session), props.now, props.locale)}
@@ -566,7 +573,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                       ) : null}
                       {/* 原「定位」语义不变：让 bot 在原话题里 @ owner，用户通过
                           消息通知回到话题；写能力与 30 秒冷却也继续沿用。 */}
-                      {kind === 'thread' && onLocate ? (() => {
+                      {isThread && onLocate ? (() => {
                         const at = locateAt.get(session.sessionId) ?? 0;
                         const elapsed = Date.now() - at;
                         const cooling = at > 0 && elapsed < LOCATE_COOLDOWN_MS;
@@ -594,7 +601,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                       })() : null}
                       {/* 「跳转」是新增的只读入口，仅在服务端已经拿到原生 `omt_`
                           话题 id 时渲染；不能把 `om_` 路由锚点伪造成原话题链接。 */}
-                      {kind === 'thread' && session.feishuThreadLink ? (
+                      {isThread && session.feishuThreadLink ? (
                         <FeishuChatAnchor
                           className="wb-session-row-action is-jump"
                           href={session.feishuThreadLink}

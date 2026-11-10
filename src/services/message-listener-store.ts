@@ -1,8 +1,11 @@
-import { getBot, type MessageListenerConfig } from '../bot-registry.js';
+import { getBot, type GroupMessageListenerOverride, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { normalizeListenerContentPolicy } from './message-listener-content-policy.js';
+import { normalizeMessageListenerReplyMode } from './message-listener-reply-policy.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
+  autoCloseAfterCompletion?: boolean;
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
@@ -10,6 +13,7 @@ export type MessageListenerUpdate = {
   senderPolicy?: MessageListenerConfig['senderPolicy'];
   messagePolicy?: MessageListenerConfig['messagePolicy'];
   contentPolicy?: MessageListenerConfig['contentPolicy'];
+  replyPolicy?: MessageListenerConfig['replyPolicy'];
 };
 
 function stringList(raw: unknown): string[] | undefined {
@@ -81,21 +85,14 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const rawContent = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
     ? entry.contentPolicy as Record<string, unknown>
     : undefined;
-  let contentPolicy: MessageListenerConfig['contentPolicy'];
-  if (rawContent) {
-    const includeKeywords = stringList(rawContent.includeKeywords);
-    // V1 is keyword-substring only (no regexes on the daemon main loop — see
-    // the contentPolicy type doc in bot-registry).
-    if (includeKeywords) {
-      contentPolicy = {
-        includeKeywords,
-        ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
-      };
-    }
-  }
+  const contentPolicy = normalizeListenerContentPolicy(rawContent);
+  const rawReply = entry.replyPolicy && typeof entry.replyPolicy === 'object' && !Array.isArray(entry.replyPolicy)
+    ? entry.replyPolicy as Record<string, unknown>
+    : {};
 
   return {
     enabled,
+    ...(entry.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(name ? { name } : {}),
     ...(replyCardTitle ? { replyCardTitle } : {}),
     ...(workingDir ? { workingDir } : {}),
@@ -103,6 +100,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
     ...(contentPolicy ? { contentPolicy } : {}),
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(rawReply.mode), sessionMode: 'per_message' },
   };
 }
 
@@ -110,6 +108,9 @@ export function validateMessageListenerUpdate(update: MessageListenerUpdate | un
   if (!update) return { ok: false, reason: 'invalid_listener' };
   if (!update.enabled) return { ok: true };
   if (!update.prompt.trim()) return { ok: false, reason: 'prompt_required' };
+  if (update.contentPolicy?.includeMentionedOpenIds !== undefined && update.contentPolicy.includeMentionedOpenIds.length === 0) {
+    return { ok: false, reason: 'keyword_identity_required' };
+  }
   const mode = update.senderPolicy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   if (mode === 'include_only' && (update.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
     return { ok: false, reason: 'sender_required' };
@@ -119,33 +120,39 @@ export function validateMessageListenerUpdate(update: MessageListenerUpdate | un
 
 export function getMessageListenerConfig(larkAppId: string, chatId: string): MessageListenerConfig | null {
   try {
-    return getBot(larkAppId).config.messageListeners?.[chatId] ?? null;
+    const override = getBot(larkAppId).config.groupMessageListenerOverrides?.[chatId];
+    return override?.mode === 'custom' ? override.listener : null;
   } catch {
     return null;
   }
 }
 
+export type GroupMessageListenerMode = 'inherit' | 'disabled' | 'custom';
+
+export function getGlobalMessageListenerConfig(larkAppId: string): MessageListenerConfig | null {
+  try { return getBot(larkAppId).config.globalMessageListener ?? null; } catch { return null; }
+}
+
+export function getGroupMessageListenerOverride(larkAppId: string, chatId: string): GroupMessageListenerOverride | null {
+  try { return getBot(larkAppId).config.groupMessageListenerOverrides?.[chatId] ?? null; } catch { return null; }
+}
+
+export function getGroupMessageListenerMode(larkAppId: string, chatId: string): GroupMessageListenerMode {
+  return getGroupMessageListenerOverride(larkAppId, chatId)?.mode ?? 'inherit';
+}
+
 /**
- * Build the persisted config for a listener update, or `null` when the update
- * carries nothing worth keeping (→ delete the entry).
+ * Build the persisted config for a listener update.
  *
- * A DISABLED listener with a non-empty prompt is a valid *draft*: it is
- * persisted with `enabled:false` so the operator can turn it on later without
- * retyping. Previously any disabled update was collapsed to `null` (deleted
- * outright), so a draft saved while the toggle was off vanished on the next
- * reload — the exact bug this fixes. Only a disabled update with a BLANK prompt
- * is a true clear (this is also what the DELETE route sends: `{enabled:false,
- * prompt:''}`). Enabled updates always carry a prompt
- * (validateMessageListenerUpdate guarantees it), so they always build a config.
- *
- * Runtime is unaffected by a persisted draft: findMessageListenerForChat and
- * enabledMessageListenerChatIds both require `enabled===true`, so an off draft
- * never matches messages — it only survives for the dashboard editor.
+ * A DISABLED listener is a valid *draft*: it is persisted with `enabled:false`
+ * so the operator can turn it on later without retyping. Runtime is unaffected:
+ * findMessageListenerForChat and enabledMessageListenerChatIds both require
+ * `enabled===true` and a prompt, so an off draft never matches messages.
  */
-export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): MessageListenerConfig | null {
-  if (!patch.prompt.trim()) return null;
+export function buildMessageListenerConfig(patch: MessageListenerUpdate): MessageListenerConfig {
   return {
     enabled: patch.enabled,
+    ...(patch.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(patch.name ? { name: patch.name } : {}),
     ...(patch.replyCardTitle ? { replyCardTitle: patch.replyCardTitle } : {}),
     ...(patch.workingDir ? { workingDir: patch.workingDir } : {}),
@@ -153,48 +160,142 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
     ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(patch.replyPolicy?.mode), sessionMode: 'per_message' },
   };
 }
 
+/**
+ * Like buildMessageListenerConfig, but `null` (→ delete the entry) for a
+ * disabled update with a BLANK prompt. The legacy per-chat endpoints
+ * (`PUT`/`DELETE /api/message-listeners/:chatId`) carry no mode, so that update
+ * is how they clear a group's rule; DELETE sends exactly `{enabled:false,
+ * prompt:''}`. Enabled updates always carry a prompt
+ * (validateMessageListenerUpdate guarantees it), so they always build a config.
+ */
+export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): MessageListenerConfig | null {
+  return patch.prompt.trim() ? buildMessageListenerConfig(patch) : null;
+}
+
+/** Legacy per-chat save: a disabled update with a blank prompt clears the rule. */
 export async function updateMessageListenerConfig(
   larkAppId: string,
   chatId: string,
   patch: MessageListenerUpdate,
 ): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  const validation = validateMessageListenerUpdate(patch);
+  if (!validation.ok) return { ok: false, reason: validation.reason };
+  return writeCustomGroupMessageListener(larkAppId, chatId, messageListenerConfigFromUpdate(patch));
+}
+
+/**
+ * Save a group's custom rule from the group page, where the mode is explicit
+ * (`mode:'inherit'` is the clear). The rule is always kept, even switched off
+ * with no prompt yet: that is how a group stops following the global rule.
+ */
+export async function saveCustomGroupMessageListener(
+  larkAppId: string,
+  chatId: string,
+  patch: MessageListenerUpdate,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  const validation = validateMessageListenerUpdate(patch);
+  if (!validation.ok) return { ok: false, reason: validation.reason };
+  return writeCustomGroupMessageListener(larkAppId, chatId, buildMessageListenerConfig(patch));
+}
+
+/** Persist `normalized` as the group's custom rule, or delete the group's entry when `null`. */
+async function writeCustomGroupMessageListener(
+  larkAppId: string,
+  chatId: string,
+  normalized: MessageListenerConfig | null,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const validation = validateMessageListenerUpdate(patch);
-  if (!validation.ok) return { ok: false, reason: validation.reason };
-
-  // A disabled update with a non-empty prompt persists as an off DRAFT (kept for
-  // the editor, never matched at runtime); only a blank-prompt disabled update
-  // clears the entry. See messageListenerConfigFromUpdate.
-  const normalized = messageListenerConfigFromUpdate(patch);
-
   const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
-    if (!normalized) {
-      if (entry.messageListeners && typeof entry.messageListeners === 'object') {
-        delete entry.messageListeners[chatId];
-        if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
-      }
-      return { write: true, result: null };
+    if (!entry.groupMessageListenerOverrides || typeof entry.groupMessageListenerOverrides !== 'object' || Array.isArray(entry.groupMessageListenerOverrides)) {
+      entry.groupMessageListenerOverrides = {};
     }
-    if (!entry.messageListeners || typeof entry.messageListeners !== 'object' || Array.isArray(entry.messageListeners)) {
-      entry.messageListeners = {};
+    if (normalized) entry.groupMessageListenerOverrides[chatId] = { mode: 'custom', listener: normalized };
+    else delete entry.groupMessageListenerOverrides[chatId];
+    if (Object.keys(entry.groupMessageListenerOverrides).length === 0) delete entry.groupMessageListenerOverrides;
+    // Compatibility shadow for the legacy Roles-page endpoint and downgrade
+    // readers. New runtime resolution always prefers group overrides.
+    if (normalized) {
+      if (!entry.messageListeners || typeof entry.messageListeners !== 'object' || Array.isArray(entry.messageListeners)) entry.messageListeners = {};
+      entry.messageListeners[chatId] = normalized;
+    } else if (entry.messageListeners && typeof entry.messageListeners === 'object') {
+      delete entry.messageListeners[chatId];
+      if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
     }
-    entry.messageListeners[chatId] = normalized;
     return { write: true, result: normalized };
   });
   if (!result.ok) return { ok: false, reason: result.reason };
 
-  if (!bot.config.messageListeners) bot.config.messageListeners = {};
-  if (normalized) bot.config.messageListeners[chatId] = normalized;
-  else {
+  if (!bot.config.groupMessageListenerOverrides) bot.config.groupMessageListenerOverrides = {};
+  if (normalized) bot.config.groupMessageListenerOverrides[chatId] = { mode: 'custom', listener: normalized };
+  else delete bot.config.groupMessageListenerOverrides[chatId];
+  if (Object.keys(bot.config.groupMessageListenerOverrides).length === 0) bot.config.groupMessageListenerOverrides = undefined;
+  // The poller and the no-override fallback read the shadow in memory, so it
+  // must change with the rule rather than at the next restart.
+  if (normalized) {
+    if (!bot.config.messageListeners) bot.config.messageListeners = {};
+    bot.config.messageListeners[chatId] = normalized;
+  } else if (bot.config.messageListeners) {
     delete bot.config.messageListeners[chatId];
     if (Object.keys(bot.config.messageListeners).length === 0) bot.config.messageListeners = undefined;
   }
 
   return { ok: true, listener: result.result };
+}
+
+export async function updateGlobalMessageListenerConfig(
+  larkAppId: string,
+  patch: MessageListenerUpdate,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const validation = validateMessageListenerUpdate(patch);
+  if (!validation.ok) return { ok: false, reason: validation.reason };
+  const normalized = messageListenerConfigFromUpdate(patch);
+  const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
+    if (normalized) entry.globalMessageListener = normalized;
+    else delete entry.globalMessageListener;
+    return { write: true, result: normalized };
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+  bot.config.globalMessageListener = normalized ?? undefined;
+  return { ok: true, listener: result.result };
+}
+
+export async function updateGroupMessageListenerMode(
+  larkAppId: string,
+  chatId: string,
+  mode: Exclude<GroupMessageListenerMode, 'custom'>,
+): Promise<{ ok: true; mode: GroupMessageListenerMode } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const result = await rmwBotEntry<GroupMessageListenerMode>(larkAppId, (entry) => {
+    if (!entry.groupMessageListenerOverrides || typeof entry.groupMessageListenerOverrides !== 'object' || Array.isArray(entry.groupMessageListenerOverrides)) entry.groupMessageListenerOverrides = {};
+    if (mode === 'disabled') entry.groupMessageListenerOverrides[chatId] = { mode: 'disabled' };
+    else delete entry.groupMessageListenerOverrides[chatId];
+    if (Object.keys(entry.groupMessageListenerOverrides).length === 0) delete entry.groupMessageListenerOverrides;
+    // The legacy field is only a downgrade/old-endpoint shadow. Leaving an old
+    // row behind when the user chooses inherit would recreate a custom override
+    // on the next config load, defeating the mode change after restart.
+    if (entry.messageListeners && typeof entry.messageListeners === 'object' && !Array.isArray(entry.messageListeners)) {
+      delete entry.messageListeners[chatId];
+      if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
+    }
+    return { write: true, result: mode };
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+  if (!bot.config.groupMessageListenerOverrides) bot.config.groupMessageListenerOverrides = {};
+  if (mode === 'disabled') bot.config.groupMessageListenerOverrides[chatId] = { mode: 'disabled' };
+  else delete bot.config.groupMessageListenerOverrides[chatId];
+  if (Object.keys(bot.config.groupMessageListenerOverrides).length === 0) bot.config.groupMessageListenerOverrides = undefined;
+  if (bot.config.messageListeners) {
+    delete bot.config.messageListeners[chatId];
+    if (Object.keys(bot.config.messageListeners).length === 0) bot.config.messageListeners = undefined;
+  }
+  return { ok: true, mode: result.result };
 }

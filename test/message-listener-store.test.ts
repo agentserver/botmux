@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, validateMessageListenerUpdate } from '../src/services/message-listener-store.js';
 
 describe('message listener store', () => {
+  it('keeps silent execution through sanitize and persistence', () => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true, prompt: 'run the configured task',
+      replyPolicy: { mode: 'none', sessionMode: 'per_message' },
+    });
+    expect(messageListenerConfigFromUpdate(update!)?.replyPolicy?.mode).toBe('none');
+  });
+
   it('keeps the custom reply card title from dashboard updates', () => {
     expect(sanitizeMessageListenerUpdate({
       enabled: true,
@@ -28,6 +36,24 @@ describe('message listener store', () => {
       replyCardTitle: '   ',
       prompt: '分析命中的告警消息',
     })).not.toHaveProperty('replyCardTitle');
+  });
+
+  it('preserves title resolution only with real keywords and boolean true', () => {
+    expect(sanitizeMessageListenerUpdate({ enabled: true, prompt: '分析文档', contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: true } })?.contentPolicy)
+      .toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
+    expect(sanitizeMessageListenerUpdate({ enabled: true, prompt: '分析文档', contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: 'true' } })?.contentPolicy)
+      .toEqual({ includeKeywords: ['智能纪要'] });
+  });
+
+  it('keeps keywords when the document-title checkbox patch follows a keyword patch', () => {
+    const keywordPatch = { includeKeywords: ['智能纪要'] };
+    const checkboxPatch = { includeKeywords: [...keywordPatch.includeKeywords], resolveDocumentTitles: true };
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '分析文档',
+      contentPolicy: { ...keywordPatch, ...checkboxPatch },
+    });
+    expect(update?.contentPolicy).toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
   });
 
   it('rejects enabled include-only listeners without selected senders', () => {
@@ -81,5 +107,14 @@ describe('messageListenerConfigFromUpdate — disabled drafts persist', () => {
     const config = messageListenerConfigFromUpdate(update({ enabled: false }));
     expect(config?.messagePolicy?.scope).toBe('top_level');
     expect(config?.replyPolicy).toEqual({ mode: 'thread', sessionMode: 'per_message' });
+  });
+});
+
+describe('listener automatic close opt-in', () => {
+  it.each([true, false, undefined, 'true', 1])('normalizes and persists strict boolean %s', value => {
+    const update = sanitizeMessageListenerUpdate({ enabled: true, prompt: 'inspect', autoCloseAfterCompletion: value });
+    expect(update).toBeDefined();
+    const saved = messageListenerConfigFromUpdate(update!);
+    expect(saved?.autoCloseAfterCompletion === true).toBe(value === true);
   });
 });

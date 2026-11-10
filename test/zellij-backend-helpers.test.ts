@@ -2,6 +2,8 @@ import { afterEach, describe, it, expect } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import {
   tmuxKeyToBytes,
   kdlString,
@@ -18,7 +20,27 @@ import {
 import {
   parseZellijVersion,
   isZellijVersionSupported,
+  zellijEnv,
 } from '../src/setup/ensure-zellij.js';
+
+describe('zellij control namespace', () => {
+  it('keeps daemon and worker clients on the same temp namespace without XDG_RUNTIME_DIR', () => {
+    const daemonEnv = zellijEnv({ HOME: '/home/owner' });
+    const workerEnv = zellijEnv({ HOME: '/home/owner', TMPDIR: '/session/one', TMP: '/session/one', TEMP: '/session/one', ZELLIJ: '1' });
+    expect(workerEnv).toEqual(daemonEnv);
+    expect(workerEnv.TMPDIR).not.toBe('/session/one');
+    expect(workerEnv.ZELLIJ).toBeUndefined();
+  });
+
+  it('preserves XDG runtime and passes session temp only to the CLI pane', () => {
+    const env = { TMPDIR: '/session/two', TMP: '/session/two', TEMP: '/session/two', XDG_RUNTIME_DIR: '/run/user/1000' };
+    expect(zellijEnv(env).XDG_RUNTIME_DIR).toBe('/run/user/1000');
+    expect(zellijEnv(env).TMPDIR).not.toBe(env.TMPDIR);
+    const layout = buildLayoutString('/bin/echo', [], { cwd: '/work', cols: 80, rows: 24, env });
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(layout).toContain(`${key}=/session/two`);
+    expect(env.TMPDIR).toBe('/session/two');
+  });
+});
 
 describe('tmuxKeyToBytes', () => {
   it('maps named keys to terminal byte sequences', () => {
@@ -46,6 +68,9 @@ describe('tmuxKeyToBytes', () => {
 });
 
 describe('kdlString', () => {
+  it('keeps multiline values inside one quoted KDL argument', () => {
+    expect(kdlString('a\nb\rc')).toBe('"a\\nb\\rc"');
+  });
   it('escapes backslashes and quotes', () => {
     expect(kdlString('a"b\\c')).toBe('"a\\"b\\\\c"');
   });
@@ -162,6 +187,34 @@ describe('parseZellijServerProcs', () => {
     expect(servers.find(s => s.pid === 1150415)!.socketPath)
       .toBe('/run/user/0/zellij/contract_version_1/zadopt-ren');
     expect(servers.map(s => s.pid)).not.toContain(9999);
+  });
+});
+
+describe.runIf(process.platform === 'linux')('zellij-socket-probe hidden CLI entry', () => {
+  it('dispatches __zellij-socket-probe to the probe instead of printing help', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'zellij-probe-entry-'));
+    const sock = join(home, 'session');
+    // The socket owner must be another process: spawnSync below blocks this
+    // event loop, so a server here would never accept() the probe's connections.
+    const server = spawn(process.execPath, ['-e',
+      `require('node:net').createServer(c => c.on('error', () => {})).listen(${JSON.stringify(sock)}, () => console.log('ready'))`,
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.stdout!.once('data', () => resolve());
+        server.once('exit', code => reject(new Error(`socket server exited ${code}`)));
+      });
+      const env = { ...process.env, HOME: home };
+      const owner = spawnSyncTsScript('src/cli.ts', ['__zellij-socket-probe', sock, String(server.pid)],
+        { env, encoding: 'utf8', timeout: 60_000 });
+      expect(owner.status).toBe(0);
+      expect(owner.stdout).toBe(String(server.pid));
+      const usage = spawnSyncTsScript('src/cli.ts', ['__zellij-socket-probe'], { env, encoding: 'utf8', timeout: 60_000 });
+      expect(usage.status).toBe(64);
+    } finally {
+      server.kill();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

@@ -9,6 +9,9 @@
  * screenshot-renderer test. Here we verify the routing + the dimensions
  * end up correct after clamping.
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
@@ -168,6 +171,8 @@ describe('snapshotToPng', () => {
     // Transient renderer must be sized off the live pane, not the fallback.
     const opts = mockedCaptureToPng.mock.calls[0][1];
     expect(opts).toEqual({ cols: 200, rows: 60, startY: 0 });
+    // Callers key their dedup on this grid: same ANSI, new canvas → new frame.
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });
 
@@ -188,5 +193,6 @@ describe('snapshotToText', () => {
     expect(result).not.toBeNull();
     expect(result!.content).toContain('line one');
     expect(result!.content).toContain('line two');
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });

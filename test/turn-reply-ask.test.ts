@@ -13,22 +13,28 @@ import { publishReplyCardAsk, replyCardAskTarget } from '../src/core/turn-reply-
 import { updateTurnReplyCard, settleTurnReplyCards, replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
+import { setAskOptionLayoutLookup } from '../src/im/lark/ask-option-layout.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
+import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
+import { bindGroupContextDelivery, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
+import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/im/lark/ask-grant-request.js', () => ({ requestGrantForAskClicker: vi.fn(async () => 'unavailable') }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: { larkAppId: 'app', cliId: 'claude-code' } }), normalizeUsageDisplay: () => 'off' }));
-vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), sendUserMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 
 const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
 const input: CreateAskInput = {
   larkAppId: 'app', sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root', timeoutMs: 60_000,
   replyCardTarget: { turnId: 'om_turn' },
-  questions: [{ prompt: '继续执行吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+  questions: [{ prompt: '继续执行吗？', allowCustom: false, multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
 };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 let dir: string;
@@ -79,6 +85,13 @@ function optionButton(key: string) {
   ).find((element: any) => element.behaviors?.some((behavior: any) =>
     ['ask_select', 'ask_toggle'].includes(behavior.value?.action) && behavior.value?.key === key));
 }
+
+function inlineAskWithQuestions(questions: PendingAsk['questions']): Parameters<typeof buildTurnReplyAskElements>[0] {
+  return { ask: {
+    askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root',
+    sessionId: 'sid', questions, createdAt: 1_000, deadlineAt: 61_000, settled: false,
+  } };
+}
 async function click(snapshot: PendingAsk, value: Record<string, string>, by = 'ou_owner', messageId = 'om_reply') {
   const response = await handleAskCardAction({
     operator: { open_id: by }, context: { open_message_id: messageId },
@@ -93,6 +106,57 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
 }
 
 describe('Ask inside the running reply card', () => {
+  it('captures native question authorship at admission and omits it for the answered refresh', async () => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root', cliId: 'claude-code', cliSessionId: 'native_ask', workerGeneration: 1 } } as DaemonSession;
+    const binding = { appId: 'app', chatId: 'oc_chat', sessionId: 'sid', turnId: 'om_turn', workerGeneration: 1,
+      epoch: groupContextEpoch('sid', 'native_ask', 'claude-code', 'om_turn') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, dir);
+    bindGroupContextDelivery(binding, dir);
+    const target = replyCardAskTarget(ds, input, { originTurnId: 'om_turn' });
+    expect(target?.groupContextAuthorOrigin).toEqual(binding);
+    const { snapshot, answer } = await ask({ replyCardTarget: target });
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toEqual(binding);
+    vi.mocked(observePublishedGroupMessage).mockClear();
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+    await Promise.allSettled([...publishing]);
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
+  });
+
+  it('masks a content-audit-rejected question patch instead of failing the question', async () => {
+    // The card already shows progress with an email; settling the question
+    // re-renders the whole card and Lark rejects that text.
+    const email = 'alice.liu@example.com';
+    const { snapshot, answer } = await ask();
+    await store.update(key, { kind: 'progress', text: `作者 <${email}>` }, io);
+    const bodies: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, _id, content) => {
+      bodies.push(content);
+      if (content.includes(email)) throw { isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+        response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } };
+      body = content;
+    });
+    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    await vi.waitFor(() => expect(body).toContain('✓ 继续'));
+    expect(bodies[0]).toContain(email);
+    expect(body).not.toContain(email);
+    expect(body).toContain('example.com');
+    expect(body).toContain('部分内容已自动打码');
+  });
+
+  it('observes the acknowledged inline question patch for shared history', async () => {
+    const { snapshot, answer } = await ask();
+    expect(observePublishedGroupMessage).toHaveBeenCalledWith('app', expect.objectContaining({
+      message_id: 'om_reply', chat_id: 'oc_chat', root_id: 'om_root', msg_type: 'interactive',
+      body: { content: body }, observed_at: expect.any(Number),
+    }));
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls[0]![1]).not.toHaveProperty('update_time');
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+  });
+
   it('keeps pending options usable when the execution history exceeds the card size limit', async () => {
     await store.update(key, { kind: 'tools', tools: [{ id: 't', name: 'Read', subject: 'large.txt', result: '工具输出'.repeat(10_000) }] }, io);
     const { snapshot, answer } = await ask();
@@ -124,6 +188,26 @@ describe('Ask inside the running reply card', () => {
     expect(body).toContain('继续执行吗');
     expect(body).toContain('✓ 继续');
     expect(body).not.toContain('ask_select');
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('submits per-question text from the same live card after another question is toggled', async () => {
+    const { snapshot, answer } = await ask({ questions: [
+      { ...input.questions[0], allowCustom: true },
+      { ...input.questions[0], prompt: '第二题', allowCustom: true },
+    ] });
+    const toggle = { action: 'ask_toggle', key: 'yes', question_index: '1', custom_form: 'v1', revision: '0' };
+    const response = await handleAskCardAction({ context: { open_message_id: 'om_reply' }, operator: { open_id: 'ou_owner' },
+      action: { value: { ...toggle, ask_id: snapshot.askId, nonce: snapshot.nonce }, form_value: { custom_0: '自定义社区', custom_1: '' } } }, { larkAppId: 'app' });
+    await (response as any)?.afterAck?.();
+    await store.update(key, { kind: 'progress', text: '等待确认' }, io);
+    expect(JSON.stringify(JSON.parse(body))).toContain('自定义社区');
+    await click(snapshot, { action: 'ask_submit', custom_form: 'v1', revision: '1' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[], ['yes']], customAnswers: ['自定义社区', null] });
+    await Promise.allSettled([...publishing]);
+    expect(body).toContain('✓ 自定义社区');
+    expect(body).toContain('✓ 继续');
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
   });
@@ -173,12 +257,27 @@ describe('Ask inside the running reply card', () => {
   });
 
   it('records timeouts without allowing a late initial snapshot to restore buttons', async () => {
-    const { snapshot, answer } = await ask({ timeoutMs: 150 });
-    expect(await answer).toMatchObject({ kind: 'timedOut' });
-    await publishReplyCardAsk(snapshot);
-    expect(body).toContain('超时未答');
-    expect(body).not.toContain('ask_select');
-    expect(body).not.toContain('等待你确认');
+    // Drive expiry only after initial publication. A real 150ms deadline can
+    // expire during filesystem work on a busy CI runner, before the helper's
+    // cardMessageId assertion, without exercising late-snapshot protection.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      const answer = registerAsk({ ...input, timeoutMs: 150 });
+      const id = _allAskIds().at(-1)!;
+      await Promise.all([...publishing]);
+      const snapshot = getAskSnapshot(id)!;
+      expect(snapshot.cardMessageId).toBe('om_reply');
+      expect(snapshot.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await answer).toMatchObject({ kind: 'timedOut' });
+      await Promise.all([...publishing]);
+      await publishReplyCardAsk(snapshot);
+      expect(body).toContain('超时未答');
+      expect(body).not.toContain('ask_select');
+      expect(body).not.toContain('等待你确认');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps callback refreshes from overwriting a newer final answer', async () => {
@@ -277,7 +376,9 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(ds, input, { originTurnId: 'om_other' })).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, chatId: 'oc_other' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, input, { ...origin, originDispatchAttempt: 2 })).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, mentionedOpenId: 'ou_human' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ ...input.questions[0], prompt: '文'.repeat(2000) }] }, origin)).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, questions: [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } }] }, origin)).toBeUndefined();
     const group = { ...ds, scope: 'chat' as const };
     expect(replyCardAskTarget(group, { ...input, rootMessageId: null }, origin)).toEqual(input.replyCardTarget);
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'oc_chat' }, origin)).toEqual(input.replyCardTarget);
@@ -319,5 +420,114 @@ describe('Ask inside the running reply card', () => {
     expect(hidden).not.toContain('config.ts');
     expect(hidden).toContain('已找到配置');
     expect(hidden).toContain('继续执行吗');
+  });
+});
+
+describe('buildTurnReplyAskElements — 选项说明', () => {
+  const notes = (elements: Array<Record<string, any>>) => elements
+    .filter(element => element.tag === 'markdown' && element.text_size === 'notation').map(element => element.content).join('\n');
+
+  it('文字作答批次不画按钮，但选项说明照常展示', () => {
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '发布方式', multiSelect: false, options: [
+        { key: 'gray', label: '灰度', description: '先放 5% 流量观察' },
+        { key: 'full', label: '全量', description: '立即放开所有流量' },
+      ] },
+      { prompt: '补充说明', multiSelect: false, options: [], inputMode: 'text' },
+    ]));
+    expect(notes(elements)).toContain('先放 5% 流量观察');
+    expect(notes(elements)).toContain('立即放开所有流量');
+    expect(JSON.stringify(elements)).not.toMatch(/ask_select|ask_toggle/);
+  });
+
+  it('选项里的 at 标签不会变成真实点名，实体解码后也不会', () => {
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '选择', multiSelect: false, options: [
+        { key: 'a', label: '<at id=ou_label></at>', description: '<at id=all></at> 和 <at id=ou_desc></at>' },
+        { key: 'b', label: 'B' },
+      ] },
+    ]));
+    expect(notes(elements).replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toMatch(/<at\b/);
+  });
+
+  // replyCardAskTarget admits at most 3000 bytes of questions JSON. `<` grows fourfold once
+  // escaped, and a described label is drawn twice in a text batch: the two worst shapes.
+  const fillGate = (questions: (n: number) => PendingAsk['questions']) => {
+    let n = 0;
+    while (Buffer.byteLength(JSON.stringify(questions(n + 1)), 'utf8') <= 3000) n++;
+    return questions(n);
+  };
+  it.each([
+    ['长说明', fillGate(n => [{ prompt: '选择', allowCustom: false, multiSelect: false, options: [
+      { key: 'a', label: 'A', description: `${'<'.repeat(n)}TAIL-A` },
+      { key: 'b', label: 'B', description: `${'<'.repeat(n)}TAIL-B` },
+    ] }])],
+    ['文字批次里的长标签', fillGate(n => [
+      { prompt: '选择', allowCustom: false, multiSelect: false, options: [
+        { key: 'a', label: `${'<'.repeat(n)}A`, description: 'TAIL-A' },
+        { key: 'b', label: `${'<'.repeat(n)}B`, description: 'TAIL-B' },
+      ] },
+      { prompt: '补充', multiSelect: false, options: [], inputMode: 'text' },
+    ])],
+  ])('能进回复卡的最大选项说明完整展示，整卡仍在请求体上限内（%s）', async (_shape, questions) => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession;
+    expect(replyCardAskTarget(ds, { ...input, questions }, { originTurnId: 'om_turn' })).toBeDefined();
+    await ask({ questions });
+    expect(body).toContain('TAIL-A');
+    expect(body).toContain('TAIL-B');
+    expect(turnReplyCardRequestBytes(body, 'oc_chat')).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+});
+
+// ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
+// unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
+// 必须与独立卡读同一个 per-bot 布局配置。
+describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
+  function makeInlineAsk(): any {
+    return {
+      ask: {
+        askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app',
+        sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root',
+        deadlineAt: Date.now() + 60_000,
+        questions: [{ prompt: 'q', multiSelect: false, options: [
+          { key: 'a', label: 'A' }, { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' }, { key: 'd', label: 'D' },
+        ] }],
+      },
+    };
+  }
+
+  afterEach(() => {
+    setAskOptionLayoutLookup(() => undefined);
+  });
+
+  it('默认 compact：选项每行 3 个（flow + auto 列）', () => {
+    setAskOptionLayoutLookup(() => undefined);
+    const els = buildTurnReplyAskElements(makeInlineAsk());
+    const rows = els.filter(el => el.tag === 'column_set');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].flex_mode).toBe('flow');
+    expect(rows[0].columns).toHaveLength(3);
+    expect(rows[1].columns).toHaveLength(1);
+    for (const row of rows) {
+      for (const col of row.columns) expect(col.width).toBe('auto');
+    }
+  });
+
+  it('vertical：每个选项一行（单列 weighted、不被同排挤压）', () => {
+    setAskOptionLayoutLookup((id) => id === 'app'
+      ? { config: { askOptionLayout: 'vertical' } }
+      : undefined);
+    const els = buildTurnReplyAskElements(makeInlineAsk());
+    const rows = els.filter(el => el.tag === 'column_set');
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.flex_mode).toBe('none');
+      expect(row.columns).toHaveLength(1);
+      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
+      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
+      expect(buttons).toHaveLength(1);
+    }
   });
 });

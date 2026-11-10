@@ -5,11 +5,11 @@ import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 type Row = { sessionId: string; larkAppId: string; [k: string]: unknown };
 type Sched = { id: string; [k: string]: unknown };
-const SESSION_PRESENTATION_FIELDS = ['botAvatarUrl', 'repoName', 'gitBranch'] as const;
+const SESSION_PRESENTATION_FIELDS = ['botAvatarUrl', 'repoName', 'gitBranch', 'workspace'] as const;
 
 function mergeSpawnedRow(current: Row | undefined, incoming: Row, larkAppId: string): Row {
   const next: Row = { ...incoming, larkAppId };
-  if (current && current.workingDir === next.workingDir) {
+  if (current && current.workingDir === next.workingDir && current.backendType === next.backendType) {
     for (const field of SESSION_PRESENTATION_FIELDS) {
       if (next[field] === undefined && current[field] !== undefined) {
         next[field] = current[field];
@@ -45,11 +45,12 @@ export class Aggregator {
         if (cur) {
           const patch = { ...ev.body.patch };
           if (
-            Object.prototype.hasOwnProperty.call(patch, 'workingDir')
-            && patch.workingDir !== cur.workingDir
+            (Object.prototype.hasOwnProperty.call(patch, 'workingDir') && patch.workingDir !== cur.workingDir)
+            || (Object.prototype.hasOwnProperty.call(patch, 'backendType') && patch.backendType !== cur.backendType)
           ) {
             patch.repoName = null;
             patch.gitBranch = null;
+            patch.workspace = null;
           }
           this.sessions.set(ev.body.sessionId, { ...cur, ...patch });
           emitted = { ...ev, body: { ...ev.body, patch } };
@@ -124,9 +125,21 @@ export class Aggregator {
   /** sessionId → owning bot daemon's terminal reverse-proxy port. Used by the
    *  dashboard `/s/*` bridge to route a terminal request to the right daemon's
    *  proxy (each bot daemon runs its own terminal proxy on proxyBasePort+idx).
-   *  undefined when the session is unknown or its daemon's proxy isn't up. */
+   *  undefined when the session is unknown or its daemon's proxy isn't up.
+   *  A dormant in-memory row keeps its proxyPort on purpose: the daemon proxy
+   *  cold-starts the worker on demand (#2062 F1). */
   terminalProxyPortOf(sessionId: string): number | undefined {
     return this.sessions.get(sessionId)?.proxyPort as number | undefined;
+  }
+
+  /** #2062: whether this replica's row for the Session has a live worker.
+   *  Only primary multi-replica routing asks this, to decide whether a local
+   *  terminal can be served without first consulting the shared owner route. */
+  hasLiveTerminalWorker(sessionId: string): boolean {
+    const row = this.sessions.get(sessionId);
+    return row?.status !== 'closed' && row?.status !== 'dormant'
+      && typeof row?.webPort === 'number' && row.webPort > 0
+      && typeof row.proxyPort === 'number' && row.proxyPort > 0;
   }
 
   /** Whether a session row with this id exists at all in the aggregator,

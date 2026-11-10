@@ -1,10 +1,15 @@
 import { z } from 'zod';
 
-import { computeNextRun, parseSchedule } from '../../core/scheduler.js';
+import {
+  authoritativeCreateFor,
+  computeNextRun,
+  getRuntimeTask,
+  normalizeTopicTitle,
+  parseSchedule,
+} from '../../core/scheduler.js';
 import {
   canonicalScheduleInput,
   createTask,
-  getTask,
   IdempotencyConflictError,
 } from '../../services/schedule-store.js';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
@@ -27,8 +32,15 @@ export type ScheduleInput = {
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
+  /** First-message template for non-silent new-topic/task runs. Supports
+   * `{{date}}`, signed day offsets, and `{{owner}}`. */
   topicTitle?: string;
   larkAppId?: string;
+  /** Run initiator's open_id, only materializable as the exact
+   *  `{ "$ref": "context.initiatorOpenId" }` binding (template-bindings
+   *  policy). Stamped onto the task so scheduled turns authenticate as the
+   *  workflow initiator; omitted for ownerless templates. */
+  ownerOpenId?: string;
   /** `repeat.completed` is intentionally absent — it's a runtime counter
    *  and must not be part of canonical input.  See schedule-store
    *  canonicalScheduleInput. */
@@ -66,9 +78,10 @@ const ScheduleInputSchema = z.object({
   chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
-  executionPosition: z.enum(['top-level', 'topic', 'new-topic']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic', 'task']).optional(),
   topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
+  ownerOpenId: z.string().optional(),
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
   silent: z.boolean().optional(),
@@ -109,12 +122,14 @@ export function parseScheduleInput(input: unknown): ScheduleInput {
 /**
  * `botmux-schedule` hostExecutor.  Calls `schedule-store.createTask`
  * passing the runtime-derived `idempotencyKey` as the deterministic
- * task id; schedule-store applies create-or-return-identical semantics
- * (Step 5).
+ * task id; create-or-return-identical semantics come from the host
+ * authority where the daemon has enrolled the bot, else from the store
+ * (Step 5).  Not `scheduler.addTask`: it normalizes scope/position, and
+ * the stored row must keep the frozen input's canonical hash.
  *
  * Provider TTL is effectively infinite for schedule (the task entry
  * lives until removed), so dangling effectAttempted reconcile uses
- * readOnlyLookup (`getTask(idempotencyKey)`) — no TTL boundary.
+ * readOnlyLookup (`getRuntimeTask(idempotencyKey)`) — no TTL boundary.
  */
 export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, ScheduleOutput> = {
   provider: 'botmux-schedule',
@@ -146,11 +161,32 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'topic execution requires rootMessageId',
       };
     }
+    if (input.executionPosition === 'task' && input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+        message: 'task execution runs in its own session and must not carry rootMessageId',
+      };
+    }
     if (input.followActive === true && input.executionPosition !== 'topic') {
       return {
         ok: false,
         errorCode: 'HOST_SCHEDULE_FOLLOW_ACTIVE_REQUIRES_TOPIC',
         message: 'followActive requires executionPosition topic',
+      };
+    }
+    try {
+      normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+        message: error instanceof Error ? error.message : String(error),
       };
     }
     if (input.parsed.kind !== 'once') return { ok: true };
@@ -181,13 +217,20 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       rootMessageId: input.rootMessageId,
       scope: input.scope,
       executionPosition: input.executionPosition,
-      topicTitle: input.topicTitle?.trim() || undefined,
+      topicTitle: normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      }),
       larkAppId: input.larkAppId,
+      ownerOpenId: input.ownerOpenId,
+      nextRunAt: computeNextRun(input.parsed) ?? undefined,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
       silent: input.silent,
       followActive: input.followActive === true ? true : undefined,
-    });
+    }, authoritativeCreateFor(input.larkAppId));
     return {
       output: { taskId: task.id },
       externalRefs: { taskId: task.id },
@@ -215,8 +258,9 @@ export const botmuxScheduleReconciler: ProviderReconciler = {
   },
 
   async readOnlyLookup(idempotencyKey, input) {
-    // Per-bot stores: address the OWNING bot's file from the frozen input's
-    // larkAppId (same routing createTask used) — a zero-arg getTask would
+    // Address the OWNING bot from the frozen input's larkAppId (same routing
+    // createTask used): its authority row once enrolled, else its per-bot
+    // file — a zero-arg lookup would
     // depend on a process-global scope that non-daemon v3 runs (cli-run /
     // goal-cli resume & reconciliation) never bind. A malformed input falls
     // through to the existing validation path below instead of failing here.
@@ -224,7 +268,7 @@ export const botmuxScheduleReconciler: ProviderReconciler = {
     if (input !== undefined) {
       try { inputAppId = parseScheduleInput(input).larkAppId; } catch { /* validated below */ }
     }
-    const task = getTask(idempotencyKey, inputAppId);
+    const task = getRuntimeTask(idempotencyKey, inputAppId);
     if (!task) {
       return {
         found: false,

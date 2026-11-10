@@ -55,6 +55,11 @@ describe('managed-origin host proof sidecar', () => {
             channelId: CHANNEL,
             sessionId: context.sessionId,
             turnId: 'turn-live',
+            callerOpenId: 'ou_current',
+            larkAppId: 'cli_app',
+            allowArbitraryMention: true,
+            scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
+            scheduleOperator: { ok: false, error: 'caller_not_allowed' },
             dispatchAttempt: 4,
             requiresCodexAppLedger: true,
             issuedAtMs: Date.now(),
@@ -63,15 +68,42 @@ describe('managed-origin host proof sidecar', () => {
         return new Response(JSON.stringify({
           // Deliberately forged transport body: it must never win.
           turnId: 'turn-forged',
+          scheduleCreator: { ok: true, ownerUnionId: 'on_forged' },
+          scheduleOperator: { ok: true },
         }), { status: 200 });
       },
     });
     expect(result).toEqual({
       sessionId: 'session-a',
       turnId: 'turn-live',
+      callerOpenId: 'ou_current',
+      larkAppId: 'cli_app',
+      allowArbitraryMention: true,
+      scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
+      scheduleOperator: { ok: false, error: 'caller_not_allowed' },
       dispatchAttempt: 4,
       requiresCodexAppLedger: true,
     });
+  });
+
+  it('rejects malformed mention permission instead of treating it as enabled', async () => {
+    const dataDir = makeRoot();
+    let now = 50_000;
+    const nonce = 'aa'.repeat(32);
+    await expect(attestManagedOrigin({
+      context: { dataDir, sessionId: 'session-a', channelId: CHANNEL,
+        capability: 'ab'.repeat(32), ipcPortFallback: 4321 },
+      nonce, timeoutMs: 3, now: () => now, wait: async delay => { now += delay; },
+      fetchImpl: async () => {
+        writeManagedOriginAttestationProof({ dataDir, proof: {
+          domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce,
+          channelId: CHANNEL, sessionId: 'session-a', turnId: 'turn-live',
+          requiresCodexAppLedger: false, issuedAtMs: now,
+          allowArbitraryMention: 'true',
+        } as any });
+        return new Response(null, { status: 200 });
+      },
+    })).rejects.toBeInstanceOf(ManagedOriginAttestationError);
   });
 
   it('rejects expired proof bytes even when HTTP returns 200', async () => {

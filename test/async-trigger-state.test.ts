@@ -130,6 +130,28 @@ describe('resolveAsyncTriggerState — completed', () => {
   });
 });
 
+describe('resolveAsyncTriggerState — interrupted', () => {
+  it('reports a precise interrupt while the session remains open', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open', memTriggerId: 'trg_stop',
+      memResult: { status: 'interrupted', interruptedAt: 7000 },
+    });
+    expect(r).toMatchObject({
+      ok: true, state: 'interrupted', triggerId: 'trg_stop',
+      finishedAt: new Date(7000).toISOString(),
+    });
+  });
+
+  it('survives a restart from the durable interrupt terminal', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: false, storedStatus: 'open',
+      persisted: { triggerId: 'trg_stop', result: { status: 'interrupted', interruptedAt: 7000 } },
+    });
+    expect(r.state).toBe('interrupted');
+    expect(r.triggerId).toBe('trg_stop');
+  });
+});
+
 describe('resolveAsyncTriggerState — running', () => {
   it('live session, pending in-memory', () => {
     const r = resolveAsyncTriggerState({
@@ -180,9 +202,44 @@ describe('resolveAsyncTriggerState — failed', () => {
       state: 'failed',
       triggerId: 'trg_a',
       errorCode: 'trigger_failed',
+      terminalErrorCode: 'provider_unexpected_eof',
       error: expect.stringContaining('provider_unexpected_eof'),
       finishedAt: new Date(7000).toISOString(),
     });
+  });
+
+  it('the raw error and screen tail of a worker-terminal failure only for a lookup that asks for them', () => {
+    const memResult = {
+      status: 'failed' as const,
+      failedAt: 7000,
+      errorCode: 'trigger_failed' as const,
+      terminalErrorCode: 'provider_authentication_failed',
+    };
+    const diagnostics = { terminalErrorDetail: 'API Error: 403 Access denied for model x', terminalScreenTail: '❯ API Error: 403' };
+    const lookup = (withDiagnostics: boolean, includeFailureDiagnostics?: boolean) => resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: true,
+      storedStatus: 'open',
+      memTriggerId: 'trg_a',
+      memResult: withDiagnostics ? { ...memResult, ...diagnostics } : memResult,
+      ...(includeFailureDiagnostics === undefined ? {} : { includeFailureDiagnostics }),
+    });
+
+    // The HTTP trigger-result route does not ask: the same response as a
+    // failure that never had them.
+    for (const asked of [undefined, false]) {
+      const response = lookup(true, asked);
+      expect('terminalErrorDetail' in response).toBe(false);
+      expect('terminalScreenTail' in response).toBe(false);
+      expect(response).toEqual(lookup(false, asked));
+    }
+    // The draft's in-process lookup asks.
+    expect(lookup(true, true)).toMatchObject({
+      state: 'failed', terminalErrorCode: 'provider_authentication_failed', ...diagnostics,
+    });
+    const without = lookup(false, true);
+    expect('terminalErrorDetail' in without).toBe(false);
+    expect('terminalScreenTail' in without).toBe(false);
   });
 
   it('rebuilds an explicit worker terminal from durable state after restart', () => {
@@ -204,6 +261,7 @@ describe('resolveAsyncTriggerState — failed', () => {
     expect(r).toMatchObject({
       state: 'failed',
       errorCode: 'trigger_failed',
+      terminalErrorCode: 'provider_server_error',
       error: expect.stringContaining('provider_server_error'),
     });
   });

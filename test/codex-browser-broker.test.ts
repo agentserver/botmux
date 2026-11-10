@@ -2,16 +2,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const approvalExec = vi.hoisted(() => vi.fn((...args: any[]) => {
   args.at(-1)(null, JSON.stringify({ answer: 'approve' }), '');
 }));
-vi.mock('node:child_process', async importOriginal => ({
-  ...await importOriginal<typeof import('node:child_process')>(), execFile: approvalExec,
-}));
+vi.mock('node:child_process', async importOriginal => {
+  const original = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
+  // Match execFile's real promisified {stdout, stderr} contract.
+  Object.defineProperty(approvalExec, promisify.custom, { value: (...args: any[]) => new Promise((resolve, reject) => {
+    approvalExec(...args, (error: Error | null, stdout: string, stderr: string) => {
+      if (error) reject(error); else resolve({ stdout, stderr });
+    });
+  }) });
+  return { ...original, execFile: approvalExec };
+});
 import {
   CODEX_BROWSER_TOOL_NAME,
   CodexBrowserBroker,
   resolveCodexBrowserPluginRoot,
   type DynamicToolCallParams,
 } from '../src/services/codex-browser-broker.js';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -126,7 +134,33 @@ describe.sequential('CodexBrowserBroker', () => {
     const reconnected = await broker.handleToolCall(call({ operation: 'list_tabs' }));
     expect(reconnected.success).toBe(true);
     expect(get).toHaveBeenCalledTimes(2);
-    expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
+  });
+
+  it('bridges app-server turn completion into the browser runtime hook', async () => {
+    const fake = fakeModules();
+    const turnEnded = vi.fn(async () => {});
+    fake.modules.setupBrowserRuntime = vi.fn(async () => {
+      (globalThis as any).nodeRepl.addTurnEndedHandler({
+        timeoutMs: 4_000,
+        run: turnEnded,
+      });
+      return { browsers: { get: vi.fn(async () => fake.browser) } };
+    });
+    broker = new CodexBrowserBroker({
+      sessionId: 'session-turn-ended',
+      family: 'chrome',
+      modules: fake.modules,
+    });
+
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    await broker.handleTurnEnded('turn-1');
+
+    expect(turnEnded).toHaveBeenCalledOnce();
+    expect(turnEnded).toHaveBeenCalledWith({
+      session_id: 'session-turn-ended',
+      turn_id: 'turn-1',
+    });
   });
 
   it('supports bounded accessibility actions without arbitrary JavaScript', async () => {
@@ -479,6 +513,24 @@ describe.sequential('CodexBrowserBroker', () => {
     expect(readConfigRequirements).toHaveBeenCalledOnce();
   });
 
+  it('passes chat-scoped browser approval to Ask with the worker anchor contract', async () => {
+    for (const [key, value] of Object.entries({
+      BOTMUX_SESSION_ID: 'session-chat', BOTMUX_CHAT_ID: 'oc_chat',
+      BOTMUX_LARK_APP_ID: 'app_chat', BOTMUX_ROOT_MESSAGE_ID: 'oc_chat', BOTMUX_SESSION_SCOPE: 'chat',
+    })) vi.stubEnv(key, value);
+    approvalExec.mockClear();
+    approvalExec.mockImplementationOnce((...args: any[]) => {
+      args.at(-1)(null, JSON.stringify({ selected: 'approve', by: 'ou_user', timedOut: false }), '');
+    });
+    broker = new CodexBrowserBroker({ sessionId: 'session-chat', family: 'chrome', modules: fakeModules().modules });
+    await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    await expect((globalThis as any).nodeRepl.createElicitation({
+      message: 'Allow this operation?', meta: { codex_approval_kind: 'mcp_tool_call' },
+    })).resolves.toMatchObject({ action: 'accept', meta: { approval_channel: 'lark' } });
+    expect(approvalExec).toHaveBeenCalledOnce();
+    expect(approvalExec.mock.calls[0].slice(0, 2)).toEqual(['botmux', expect.arrayContaining(['ask', 'buttons'])]);
+  });
+
   it('fails closed for secure browser authentication elicitations', async () => {
     for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_ROOT_MESSAGE_ID']) {
       vi.stubEnv(key, 'browser-auth-test');
@@ -529,7 +581,7 @@ describe('resolveCodexBrowserPluginRoot', () => {
         writeFileSync(join(scripts, 'browser-client.mjs'), 'export {}');
         writeFileSync(join(scripts, 'browser-service.mjs'), 'export {}');
       }
-      expect(resolveCodexBrowserPluginRoot()).toBe(
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(
         realpathSync(join(root, 'plugins', 'cache', 'openai-bundled', 'chrome', '26.10.1')),
       );
     } finally {
@@ -538,4 +590,146 @@ describe('resolveCodexBrowserPluginRoot', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('loads the newer desktop plugin instead of a stale cache latest symlink', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const old = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(old, join(cache, 'latest'), 'junction');
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('keeps a newer complete cache and ignores an incomplete desktop update', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.1029.61003');
+      const newest = plugin(join(cache, '26.1105.1'));
+      plugin(join(cache, '26.1007.21434'));
+      mkdirSync(join(cache, '26.1201.1', 'scripts'), { recursive: true });
+      writeFileSync(join(cache, '26.1201.1', 'scripts', 'browser-client.mjs'), 'export {}');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+      rmSync(join(bundled, 'scripts', 'browser-service.mjs'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+    });
+  });
+
+  it('finds a desktop plugin without a CLI cache and honors an explicit pin', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+      const pinned = plugin(join(cache, '26.1007.21434'));
+      expect(resolveCodexBrowserPluginRoot(pinned, [bundled])).toBe(realpathSync(pinned));
+      rmSync(join(pinned, 'scripts', 'browser-service.mjs'));
+      expect(() => resolveCodexBrowserPluginRoot(pinned, [bundled])).toThrow('incomplete');
+    });
+  });
+
+  it('uses numeric versions and falls back to a cache directory with an invalid manifest', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.9.0');
+      const newest = plugin(join(cache, '26.10.1'), 'invalid');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+    });
+  });
+
+  it('replaces a stale latest symlink with a newer complete cache version', () => {
+    withPlugins(({ cache, plugin }) => {
+      const stale = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(stale, join(cache, 'latest'), 'junction');
+      const newest = plugin(join(cache, '26.1105.1'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(realpathSync(newest));
+    });
+  });
+
+  it('prefers a newer desktop plugin over the newest cache directory', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('keeps the cache choice when no candidate has a strictly newer version', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const current = plugin(join(cache, '26.1105.1'));
+      symlinkSync(current, join(cache, 'latest'), 'junction');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(current));
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1105.1');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(current));
+    });
+  });
+
+  it('keeps a latest directory whose version cannot be determined', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const latest = plugin(join(cache, 'latest'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(realpathSync(latest));
+      plugin(join(cache, '26.1105.1'));
+      plugin(bundled, '26.1201.1');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(latest));
+    });
+  });
+
+  it('does not let a non-version cache directory shadow version directories', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(join(cache, 'local'));
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('honors an explicit plugin root over newer discovered plugins', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const pinned = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(plugin(join(cache, '26.1105.1')), join(cache, 'latest'), 'junction');
+      plugin(bundled, '26.1201.1');
+      expect(resolveCodexBrowserPluginRoot(pinned, [bundled])).toBe(realpathSync(pinned));
+    });
+  });
+
+  it('lists the desktop locations it checked when no complete plugin is found', () => {
+    withPlugins(({ cache, bundled }) => {
+      const otherApp = join(cache, '..', 'other-app', 'chrome');
+      mkdirSync(join(bundled, 'scripts'), { recursive: true });
+      writeFileSync(join(bundled, 'scripts', 'browser-client.mjs'), 'export {}');
+      let message = '';
+      try {
+        resolveCodexBrowserPluginRoot(undefined, [bundled, otherApp]);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain(cache);
+      expect(message).toContain(bundled);
+      expect(message).toContain(otherApp);
+    });
+  });
+
+  function withPlugins(run: (fixture: {
+    cache: string; bundled: string; plugin: (root: string, version?: string) => string;
+  }) => void): void {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-browser-plugin-'));
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = root;
+    try {
+      run({
+        cache: join(root, 'plugins', 'cache', 'openai-bundled', 'chrome'),
+        bundled: join(root, 'desktop', 'plugins', 'chrome'),
+        plugin: (path, version) => {
+          mkdirSync(join(path, 'scripts'), { recursive: true });
+          writeFileSync(join(path, 'scripts', 'browser-client.mjs'), 'export {}');
+          writeFileSync(join(path, 'scripts', 'browser-service.mjs'), 'export {}');
+          if (version) {
+            mkdirSync(join(path, '.codex-plugin'), { recursive: true });
+            writeFileSync(join(path, '.codex-plugin', 'plugin.json'), JSON.stringify({ version }));
+          }
+          return path;
+        },
+      });
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });

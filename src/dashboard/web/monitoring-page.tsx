@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import type { LarkConnectionHealth } from '../../im/lark/transport/connection-health.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
+import { ui } from './ui.js';
 import {
   InfoTip,
   LoadingState,
@@ -25,9 +28,16 @@ type ResourceCurrent = {
     cli: { cpuPct?: number; rssBytes?: number };
   };
   bots?: ResourceBot[];
+  larkConnections?: LarkConnectionRow[];
   sessions?: ResourceSession[];
   runtime?: RuntimeSummary;
   rankings?: { tracked?: string[] };
+};
+
+type LarkConnectionRow = {
+  larkAppId: string;
+  botName: string;
+  larkConnection?: LarkConnectionHealth | null;
 };
 
 type ResourceHistory = {
@@ -325,37 +335,13 @@ function ExpandableTrendCell(props: { label: string; onOpen(): void; children: R
 
 function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): void }) {
   const tr = useT();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.detail) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* dialog already opening */ }
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [props.detail]);
-
-  useEffect(() => () => {
-    const dialog = dialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
 
   return (
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={!!props.detail}
       className="resource-detail-modal"
-      onCancel={event => {
-        event.preventDefault();
-        props.onClose();
-      }}
       onClose={props.onClose}
-      onClick={event => {
-        if (event.target === event.currentTarget) props.onClose();
-      }}
+      onRequestClose={props.onClose}
     >
       {props.detail ? (
         <article className="resource-detail-modal-card">
@@ -388,7 +374,7 @@ function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): 
           </div>
         </article>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -402,6 +388,33 @@ function ResourcePill({ label, value, tone }: { label: string; value: string; to
       <span>{label}</span>
       <b>{value}</b>
     </span>
+  );
+}
+
+function LarkConnectionList({ rows }: { rows: LarkConnectionRow[] }) {
+  const tr = useT();
+  const date = new Intl.DateTimeFormat(ui.locale, { dateStyle: 'short', timeStyle: 'long' });
+  return (
+    <section className="overview-block resource-block">
+      <SectionHeader title={tr('monitoring.larkConnections')} />
+      <div className="panel resource-connections">
+        <table aria-label={tr('monitoring.larkConnections')}>
+          <thead><tr>
+            <th>Bot</th><th>{tr('monitoring.wsState')}</th><th>{tr('monitoring.wsSince')}</th>
+            <th>{tr('monitoring.wsAttempts')}</th><th>{tr('monitoring.wsLastInbound')}</th>
+          </tr></thead>
+          <tbody>{rows.map(({ larkAppId, botName, larkConnection: ws }) => (
+            <tr key={larkAppId}>
+              <th scope="row">{botName || larkAppId}</th>
+              <td className="resource-ws-state" data-state={ws?.state}>{ws?.state ?? (ws === null ? 'disabled' : 'unknown')}</td>
+              <td>{ws ? date.format(ws.since) : '—'}</td>
+              <td>{ws?.attempts ?? '—'}</td>
+              <td>{ws?.lastInboundAt != null ? date.format(ws.lastInboundAt) : '—'}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -619,6 +632,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
       {ready ? (
         <>
       {current ? <RuntimeHealth current={current} /> : null}
+      {current?.larkConnections?.length ? <LarkConnectionList rows={current.larkConnections} /> : null}
 
       {!supported ? (
         <section className="panel resource-unavailable">

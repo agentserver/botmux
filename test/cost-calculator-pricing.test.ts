@@ -8,6 +8,9 @@
  *
  * Run:  pnpm vitest run test/cost-calculator-pricing.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
@@ -102,6 +105,12 @@ vi.mock('../src/services/jsonl-cursor.js', async (importOriginal) => {
 
 vi.mock('../src/adapters/cli/registry.js', () => ({
   createCliAdapterSync: vi.fn(() => ({ claudeDataDir: '/fake/pkg/.claude-runtime' })),
+}));
+
+// resolveSessionTranscriptPath() 的 codex 分支会查会话库里的实例绑定。
+// 本套件整体 mock 了 node:fs，真实 store 会读到合成文件系统；stub 掉它需要的这一个入口。
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
 }));
 
 import { existsSync, readFileSync } from 'node:fs';

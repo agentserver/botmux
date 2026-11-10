@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -128,7 +131,7 @@ describe('schedule store → dashboard notifications', () => {
   it('preserves enriched rows already announced by the dashboard create endpoint', async () => {
     const { store, agg, events, flush } = await setup();
     const { dashboardEventBus } = await import('../src/core/dashboard-events.js');
-    const task = store.createTask({ ...params, id: 'dashboard-created' });
+    const task = store.createTask({ ...params, id: 'dashboard_created' });
     dashboardEventBus.publish({
       type: 'schedule.created',
       body: { schedule: { ...task, botName: 'Reporter', preconditionSource: 'inline' } },

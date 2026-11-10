@@ -45,6 +45,8 @@ function retryAction(): any {
 
 async function fresh() {
   vi.resetModules();
+  const sessionStore = await import('../src/services/session-store.js');
+  sessionStore.init('h1');
   const types = await import('../src/core/types.js');
   const registry = await import('../src/bot-registry.js');
   const handler = await import('../src/im/lark/card-handler.js');
@@ -57,6 +59,7 @@ beforeEach(() => {
   const cfg = join(dir, 'bots.json');
   writeFileSync(cfg, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code' }], null, 2));
   process.env.BOTS_CONFIG = cfg;
+  process.env.SESSION_DATA_DIR = dir;
   deps.activeSessions = new Map();
 });
 afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
@@ -261,7 +264,8 @@ describe('card-handler retry_last_task', () => {
     // durable Codex App dispatcher assigns a fresh synthetic identity so this
     // retry has its own ledger ownership and final attribution.
     expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId)
-      .toMatch(/^codex-app-dispatch-/);
+      .toBe(ds.lastCliInputTurnId);
+    expect(ds.lastCliInputTurnId).toEqual(expect.any(String));
     expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId).not.toBe('om_original');
     expect(send.mock.calls[0][0].codexAppDispatchId).toEqual(expect.any(String));
   });

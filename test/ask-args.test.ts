@@ -12,6 +12,7 @@ import {
   AskArgsError,
   findMissingAskEnv,
   normalizeAskDispatch,
+  parseAskMention,
   parseAskOptions,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
@@ -124,6 +125,33 @@ describe('parseAskTimeoutSeconds', () => {
   });
 });
 
+describe('parseAskMention', () => {
+  it('returns undefined when flag absent', () => {
+    expect(parseAskMention(undefined)).toBeUndefined();
+  });
+
+  it('accepts a bare human open_id', () => {
+    expect(parseAskMention('ou_humanTarget0001'))
+      .toBe('ou_humanTarget0001');
+  });
+
+  it('accepts open_id:Display Name form and drops the name', () => {
+    expect(parseAskMention('ou_abcdef123456:张伟'))
+      .toBe('ou_abcdef123456');
+    expect(parseAskMention('  ou_abcdef123456 :Some One  '))
+      .toBe('ou_abcdef123456');
+  });
+
+  it('rejects empty value, union_id, and other id shapes', () => {
+    expect(() => parseAskMention('')).toThrowError(AskArgsError);
+    expect(() => parseAskMention('   ')).toThrowError(/open_id/);
+    // union_id / 其它 ID 形态进卡片 <at> 会被飞书整卡拒收
+    expect(() => parseAskMention('on_6741d98b6423c1b46e1ef7a5e6dd'))
+      .toThrowError(/ou_/);
+    expect(() => parseAskMention('not-an-open-id')).toThrowError(/ou_/);
+  });
+});
+
 describe('normalizeAskDispatch', () => {
   it('canonical form: `ask buttons --options ...` keeps sub=buttons', () => {
     expect(normalizeAskDispatch(['buttons', '--options', 'yes,no', 'prompt'])).toEqual({
@@ -167,6 +195,13 @@ describe('normalizeAskDispatch', () => {
 });
 
 describe('findMissingAskEnv', () => {
+  it('chat scope has no message root, while thread and legacy callers require one', () => {
+    const env = { BOTMUX_SESSION_ID: 'sess-1', BOTMUX_CHAT_ID: 'oc_1', BOTMUX_LARK_APP_ID: 'cli_1' };
+    expect(findMissingAskEnv({ ...env, BOTMUX_SESSION_SCOPE: 'chat' })).toBeNull();
+    expect(findMissingAskEnv({ ...env, BOTMUX_SESSION_SCOPE: 'thread' })).toBe('BOTMUX_ROOT_MESSAGE_ID');
+    expect(findMissingAskEnv(env)).toBe('BOTMUX_ROOT_MESSAGE_ID');
+  });
+
   it('returns null when all four env vars are present', () => {
     expect(
       findMissingAskEnv({

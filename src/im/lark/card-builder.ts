@@ -1,18 +1,24 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
+import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { CLI_DISPLAY_NAMES, lookupCliDisplayName } from '../../adapters/cli/display-names.js';
+import { allowlistSandboxVerifiedClis } from '../../core/shared-bot-sandbox-advice.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -20,8 +26,15 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { modelPinText } from '../../core/model-pin.js';
+import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import type { SubstituteCardControl } from './substitute-card-control.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
+import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
+import { stuckPageSpec } from '../../core/stuck-page-catalog.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -29,6 +42,94 @@ export const CONFIG_UNSET = '__unset__';
 /** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
  *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
 export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+export type TurnTerminalReceiptKind = 'completed' | 'silent';
+
+/** Independent, low-visual-weight terminal marker used when auto mode cannot
+ * patch the last visible carrier (for example a file, voice, or custom card).
+ * It is deliberately headerless and action-free: the answer/progress messages
+ * keep their own presentation while this final strip only answers whether the
+ * agent is still working or has returned control to the user. */
+export function buildTurnTerminalReceiptCard(
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    body: {
+      direction: 'vertical',
+      padding: '8px 12px 8px 12px',
+      elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+      }],
+    },
+  });
+}
+
+function findCardElementById(value: unknown, elementId: string): any | undefined {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findCardElementById(child, elementId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const element = value as Record<string, unknown>;
+  if (element.element_id === elementId) return element;
+  for (const key of ['elements', 'columns', 'actions', 'extra'] as const) {
+    const found = findCardElementById(element[key], elementId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function withoutKnownTurnTerminalReceipt(content: string): string {
+  const known = [
+    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
+  ];
+  let result = content;
+  for (const label of known) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    result = result.replace(new RegExp(`\\s*·\\s*(?:<font color=['\"]grey['\"]>)?${escaped}(?:<\\/font>)?\\s*$`), '');
+  }
+  return result.trimEnd();
+}
+
+function appendTurnTerminalReceiptToFooter(content: string, label: string): string {
+  const outerGrey = /^(<font color=['"]grey['"]>)([\s\S]*)(<\/font>)$/.exec(content);
+  if (outerGrey) {
+    const base = withoutKnownTurnTerminalReceipt(outerGrey[2]);
+    return `${outerGrey[1]}${base} · ${label}${outerGrey[3]}`;
+  }
+  const base = withoutKnownTurnTerminalReceipt(content);
+  return `${base} · <font color='grey'>${label}</font>`;
+}
+
+/** Build a footer-only CardKit update. Message reads may normalize Markdown;
+ * never submit their body as the source of a full-card update. */
+export function buildTurnTerminalFooterPatch(
+  cardJson: string,
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): { content: string } | undefined {
+  let card: any;
+  try { card = JSON.parse(cardJson); } catch { return undefined; }
+  if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
+  const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
+  if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
+    return undefined;
+  }
+  return { content: appendTurnTerminalReceiptToFooter(
+    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+  ) };
+}
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
  *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
@@ -40,9 +141,9 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -56,7 +157,7 @@ function configSelect(placeholder: string, initial: string, options: Array<{ tex
 }
 
 function configSubheader(secKey: string, locale?: Locale): any {
-  return { tag: 'div', text: { tag: 'lark_md', content: `**${t(secKey, undefined, locale)}**` } };
+  return larkMdDiv(`**${t(secKey, undefined, locale)}**`);
 }
 
 /**
@@ -77,10 +178,41 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     text: {
       tag: 'lark_md',
       content: t('card.config.summary', {
-        cli: data.cliId, model: data.model ?? def, lang: data.lang ?? def, admins: data.admins,
+        cli: data.cliId, model: (data.model ? data.modelChoiceLabels?.[data.model] ?? data.model : def), lang: data.lang ?? def, admins: data.admins,
       }, locale),
     },
   });
+
+  if (data.sandboxAdvice) {
+    // Short lines, one fact each: why, how to turn it on, the current CLI; the
+    // verified list folds away.
+    const advice = data.sandboxAdvice;
+    const sep = t('card.config.sandbox_advice.sep', undefined, locale);
+    const name = (id: string) => lookupCliDisplayName(id) ?? id;
+    // A sandbox-refusing backend (herdr/zellij/zmx/orca/…): skip the "turn it
+    // on" line and the matrix list — the backend-blocked line is the action.
+    const backendBlocked = advice.cliSupport === 'blocked';
+    const lines = [
+      t('card.config.sandbox_advice', undefined, locale),
+      t('card.config.sandbox_advice.reasons', {
+        reasons: advice.reasons.map(r => t(`card.config.sandbox_advice.${r}`, undefined, locale)).join(sep),
+      }, locale),
+    ];
+    if (!backendBlocked) lines.push(t('card.config.sandbox_advice.action', undefined, locale));
+    lines.push(t(`card.config.sandbox_advice.${advice.cliSupport}`, { cli: name(advice.cliId) }, locale));
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    if (!backendBlocked) {
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: { tag: 'plain_text', content: t('card.config.sandbox_advice.list_title', undefined, locale) },
+          icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        elements: [{ tag: 'markdown', content: allowlistSandboxVerifiedClis().map(name).join(sep) }],
+      });
+    }
+  }
 
   // ── 🧠 运行: cli / model / lang ─────────────────────────────────────────
   elements.push({ tag: 'hr' });
@@ -90,8 +222,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   ];
   if (data.modelChoices.length > 0) {
     runSelects.push(configSelect('model', data.model ?? CONFIG_UNSET,
-      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: m, value: m }))],
+      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: data.modelChoiceLabels?.[m] ?? m, value: m }))],
       { action: 'config_set', field: 'model', ...locVal }));
+  }
+  if (data.reasoningEfforts && data.reasoningEfforts.length > 0) {
+    runSelects.push(configSelect(t('card.config.effort', undefined, locale),
+      data.reasoningEffort ?? CONFIG_UNSET,
+      [{ text: def, value: CONFIG_UNSET }, ...data.reasoningEfforts.map(level => ({ text: level, value: level }))],
+      { action: 'config_set', field: 'reasoningEffort', ...locVal }));
   }
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
@@ -112,17 +250,18 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
+  if (data.cliId === 'zcode') elements.push({ tag: 'div', text: { tag: 'plain_text', content: locale === 'en' ? 'Model changes apply to new topics. Existing topics keep their own model and conversation.' : '模型修改对新话题生效；已有话题保留各自的模型和对话。' } });
+
   // ── 布尔开关分组 ─────────────────────────────────────────────────────────
   const onMap = new Map(data.booleans.map(b => [b.key, b.on]));
   for (const g of CONFIG_CARD_BOOLEAN_GROUPS) {
     const btns = g.keys.filter(k => onMap.has(k)).map(k => {
       const on = onMap.get(k) === true;
-      return {
-        tag: 'button',
-        text: { tag: 'plain_text', content: `${on ? '🟢' : '⚪'} ${t('config.label.' + k, undefined, locale)}` },
-        type: on ? 'primary' : 'default',
-        value: { action: 'config_toggle', field: k, ...locVal },
-      };
+      return callbackButton(
+        `${on ? '🟢' : '⚪'} ${t('config.label.' + k, undefined, locale)}`,
+        on ? 'primary' : 'default',
+        { action: 'config_toggle', field: k, ...locVal },
+      );
     });
     elements.push({ tag: 'hr' });
     elements.push(configSubheader(g.sec, locale));
@@ -147,12 +286,11 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
       });
       elements.push({
         tag: 'action',
-        actions: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: t('card.config.quota_edit', undefined, locale) },
-          type: 'default',
-          value: { action: 'config_quota_open', ...locVal },
-        }],
+        actions: [callbackButton(
+          t('card.config.quota_edit', undefined, locale),
+          'default',
+          { action: 'config_quota_open', ...locVal },
+        )],
       });
     }
   }
@@ -162,20 +300,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   elements.push({ tag: 'hr' });
   elements.push({
     tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.config.text_btn', undefined, locale) },
-      type: 'default',
-      value: { action: 'config_text_open', ...locVal },
-    }],
+    actions: [callbackButton(t('card.config.text_btn', undefined, locale), 'default', { action: 'config_text_open', ...locVal })],
   });
   elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.config.note', undefined, locale) }] });
 
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.title', { name: data.botName }, locale) } },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
 /**
@@ -186,7 +318,7 @@ export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): str
   const locVal: Record<string, string> = locale ? { loc: locale } : {};
   const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
   const elements: any[] = [
-    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.quota_input_note', undefined, locale) } },
+    larkMdDiv(t('card.config.quota_input_note', undefined, locale)),
   ];
   if (legacyQuota) {
     elements.push({
@@ -220,14 +352,10 @@ export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): str
       },
     ],
   });
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.config.quota_input_title', { name: data.botName }, locale) },
-    },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.quota_input_title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
 /**
@@ -242,7 +370,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
   // form 内只放 input+button（与仓库已验证的 TUI 表单同构），label 放 form 外，
   // 否则 form 里混入 div 会整卡渲染失败（空卡）。每字段独立保存。
   const section = (lblKey: string, name: string, value: string | null): any[] => ([
-    { tag: 'div', text: { tag: 'lark_md', content: `**${t(lblKey, undefined, locale)}**` } },
+    larkMdDiv(`**${t(lblKey, undefined, locale)}**`),
     {
       tag: 'form',
       name: `config_form_${name}`,
@@ -260,7 +388,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     },
   ]);
   const elements: any[] = [
-    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.text_note', undefined, locale) } },
+    larkMdDiv(t('card.config.text_note', undefined, locale)),
     { tag: 'hr' },
     ...section('card.config.lbl_brand', 'brandLabel', data.brandLabel),
     { tag: 'hr' },
@@ -272,49 +400,15 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     { tag: 'hr' },
     ...section('card.config.lbl_role', 'teamRole', data.teamRole),
   ];
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.text_title', { name: data.botName }, locale) } },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.text_title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
-const cliDisplayNames: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'seed': 'Seed',
-  'relay': 'Relay',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'codex-app': 'Codex App',
-  'cursor': 'Cursor',
-  'gemini': 'Gemini',
-  'genius': 'Genius',
-  'opencode': 'OpenCode',
-  'opencode2': 'OpenCode 2',
-  'antigravity': 'Antigravity',
-  'mtr': 'MTR',
-  'hermes': 'Hermes',
-  'mira': 'Mira',
-  'mir': 'Mir CLI',
-  'traex': 'TRAE',
-  'pi': 'Pi',
-  'copilot': 'Copilot',
-  'oh-my-pi': 'Oh My Pi',
-  'ebsd': 'ebsd',
-  'kimi': 'Kimi',
-  'grok': 'Grok Build',
-  'kiro-cli': 'Kiro',
-  'riff': 'Riff',
-  'reasonix': 'Reasonix',
-  'dsh': 'DeepSeek Harness',
-  'dsh-tui': 'DeepSeek Harness TUI',
-  'mojo': 'Mojo',
-  'minimax': 'MiniMax',
-};
 
 export function getCliDisplayName(cliId: CliId): string {
-  return cliDisplayNames[cliId] ?? cliId;
+  return CLI_DISPLAY_NAMES[cliId] ?? cliId;
 }
 
 /** Escape Lark markdown special characters in user-controlled strings.
@@ -323,6 +417,11 @@ export function getCliDisplayName(cliId: CliId): string {
  *  `<at id=…></at>` tag and spoof a mention in a `lark_md` body. */
 function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
+}
+
+/** Inline code is literal: markdown escaping would surface visible backslashes. */
+function inlineCode(s: string): string {
+  return `\`${s.replace(/[`\r\n]+/g, '')}\``;
 }
 
 /** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
@@ -406,12 +505,7 @@ function localCliButton(
       : cliId === 'traex'
         ? 'card.btn.open_local_trae'
         : 'card.btn.open_local_cli';
-  return {
-    tag: 'button',
-    text: { tag: 'plain_text', content: t(labelKey, { cliName }, locale) },
-    type: 'default',
-    value: { action: 'open_local_cli', ...actionBase },
-  };
+  return callbackButton(t(labelKey, { cliName }, locale), 'default', { action: 'open_local_cli', ...actionBase });
 }
 
 /**
@@ -430,29 +524,29 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
   const actions: any[] = [];
   if (terminalUrl) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
-      type: 'primary',
-      multi_url: terminalMultiUrl(terminalUrl),
-    });
+    actions.push(urlButton(
+      t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale),
+      'primary',
+      terminalMultiUrl(terminalUrl),
+    ));
   }
   if (!showManageButtons) {
     const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
     if (localBtn) actions.push(localBtn);
     if (terminalUrl) {
-      actions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-        type: 'default',
-        value: { action: 'get_write_link', ...actionBase },
-      });
+      actions.push(callbackButton(
+        t('card.btn.get_write_link', undefined, locale),
+        'default',
+        { action: 'get_write_link', ...actionBase },
+      ));
     }
   }
   // No restart button for ANY remote CLI: the riff worker refuses the IPC
@@ -462,38 +556,32 @@ export function buildSessionCard(
   // review, gate 1); the click handler also guards, this keeps the surface
   // honest.
   if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
-      type: 'default',
-      value: { action: 'restart', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.restart_cli', { cliName }, locale), 'default', { action: 'restart', ...actionBase }));
   }
   if (adoptMode) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-      type: 'danger',
-      value: { action: 'disconnect', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
   } else {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-      type: 'danger',
-      value: { action: 'close', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${plainTitle(title)}` },
-      template: 'blue',
-    },
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
+  const card = wideCard({
+    header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
+      // Frozen session sandbox (oncall / scratch) gets one notation line; an
+      // unsandboxed session keeps the legacy card byte-for-byte.
+      ...(sessionSandbox === 'oncall' || sessionSandbox === 'scratch'
+        ? [{
+            tag: 'markdown',
+            content: t(sessionSandbox === 'scratch' ? 'card.body.session_sandbox_scratch' : 'card.body.session_sandbox_oncall', undefined, locale),
+            text_size: 'notation',
+          }]
+        : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -506,12 +594,25 @@ export function buildSessionCard(
  * `claude --resume <id>`), built by the per-CLI adapter's
  * `buildResumeCommand`. That keeps the conversation portable: users can
  * pick it up locally without going through botmux. CLIs that can't resume
- * a specific session from CLI args (gemini's "latest only") surface a
+ * a specific session from CLI args (a "latest only" mode) surface a
  * fallback note instead of a fake command.
  *
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
  * Lark bridge so future replies route back into this topic.
  */
+/**
+ * The closed card's worktree section (#698), present only when the session's
+ * working dir is a worktree botmux created. Absent → the card is byte-for-byte
+ * the legacy one. Present → the card is shareable-updatable so the click result
+ * can replace it in place.
+ */
+export interface ClosedCardWorktreeCleanup {
+  /** Markdown under the body: the offer, "checking…", or the click result. */
+  note: string;
+  /** Show the button: the offer, or a refusal the user can fix and retry. */
+  button: boolean;
+}
+
 export function buildSessionClosedCard(
   sessionId: string,
   rootId: string,
@@ -522,6 +623,7 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
+  worktreeCleanup?: ClosedCardWorktreeCleanup,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
@@ -538,28 +640,37 @@ export function buildSessionClosedCard(
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.session_closed', undefined, locale) },
+  const resumeButton = callbackButton(
+    t('card.btn.resume_session', undefined, locale),
+    'primary',
+    { action: 'resume', ...actionBase },
+  );
+  if (!worktreeCleanup) {
+    return JSON.stringify(simpleCard({
+      title: t('card.status.session_closed', undefined, locale),
       template: 'grey',
-    },
+      markdown: body,
+      buttons: [resumeButton],
+    }));
+  }
+  // The button carries only the session id: the directory is re-read from the
+  // session row and botmux's creation record on click, never from the card.
+  const buttons = worktreeCleanup.button
+    ? [resumeButton, callbackButton(
+        t('card.btn.cleanup_worktree', undefined, locale),
+        'default',
+        { action: CLEANUP_SESSION_WORKTREE_ACTION, root_id: rootId, session_id: sessionId },
+      )]
+    : [resumeButton];
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.status.session_closed', undefined, locale), 'grey'),
     elements: [
       { tag: 'markdown', content: body },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.btn.resume_session', undefined, locale) },
-            type: 'primary',
-            value: { action: 'resume', ...actionBase },
-          },
-        ],
-      },
+      { tag: 'markdown', content: worktreeCleanup.note },
+      { tag: 'action', actions: buttons },
     ],
-  };
-  return JSON.stringify(card);
+    extraConfig: { update_multi: true },
+  }));
 }
 
 /** Parent-topic panel for `/fork <task>`. Links and live/closed state are
@@ -572,10 +683,7 @@ export function buildForkPanelCard(
     return JSON.stringify({
       schema: '2.0',
       config: { update_multi: true },
-      header: {
-        template: 'purple',
-        title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
-      },
+      header: cardHeaderTemplateFirst('purple', t('card.fork_panel.title', undefined, locale)),
       body: {
         direction: 'vertical',
         elements: [{ tag: 'markdown', content: t('card.fork_panel.empty', undefined, locale) }],
@@ -593,24 +701,13 @@ export function buildForkPanelCard(
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      template: 'purple',
-      title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('purple', t('card.fork_panel.title', undefined, locale)),
     body: {
       direction: 'vertical',
       elements: [{
         tag: 'table',
         page_size: 10,
-        row_height: 'low',
-        header_style: {
-          text_align: 'left',
-          text_size: 'normal',
-          background_style: 'grey',
-          text_color: 'default',
-          bold: true,
-          lines: 1,
-        },
+        ...TABLE_AUTO_ROW_STYLE,
         columns: [
           { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
           { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
@@ -696,15 +793,7 @@ export function buildSlashListCard(
     elements.push({
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left',
-        text_size: 'normal',
-        background_style: 'grey',
-        text_color: 'default',
-        bold: true,
-        lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'cmd', display_name: t('slashlist.col_cmd', undefined, locale), data_type: 'lark_md', width: '200px' },
         { name: 'desc', display_name: t('slashlist.col_desc', undefined, locale), data_type: 'text', width: 'auto' },
@@ -733,29 +822,8 @@ export function buildSlashListCard(
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('slashlist.heading', { cliName }, locale) },
-    },
+    header: cardHeaderTemplateFirst('blue', t('slashlist.heading', { cliName }, locale)),
     body: { direction: 'vertical', elements },
-  });
-}
-
-
-export function buildDetouredPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'grey',
-      title: { tag: 'plain_text', content: t('card.pending.detoured_title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.detoured_body', undefined, locale) },
-      ],
-    },
   });
 }
 
@@ -806,22 +874,27 @@ export function buildRelayedFrozenCard(
       preview: true,
     });
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.relay_frozen', undefined, locale) },
-      template: 'grey',
-    },
+  const card = wideCard({
+    header: cardHeader(t('card.status.relay_frozen', undefined, locale), 'grey'),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
+
+/**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
 
 /**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
@@ -830,7 +903,7 @@ const MAX_CONTENT_BYTES = 100_000;
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -838,29 +911,119 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
     }
   }
-  return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
+  let tail = lines.slice(lo).join('\n');
+  if (!tail.trim() && content.trim()) {
+    // Only blank trailing lines fit: the last non-blank line alone exceeds the
+    // budget (e.g. a minified blob with no newline, optionally ending in \n).
+    // Keep that line's byte tail instead of returning an empty body.
+    const budget = Math.max(0, maxBytes - 30);
+    let last = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') { last = lines[i]; break; }
+    }
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
+  }
+  return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
 
 /** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
+/** idle 状态下卡头的替代标签：
+ *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
+ *  - 'completed'：transcript 模式下最终回复卡已投递成功。
+ *  只对 idle 生效，其它状态一律忽略。 */
+export type IdleCardLabel = 'silent' | 'completed' | 'failed';
+
+/** 主回合已结束、但它派出的后台子任务（后台 agent / 后台 Bash / Monitor）仍有
+ *  `backgroundTasks` 个在运行。working 与 idle 都可能带它（是否钉住 working 由
+ *  worker 既有规则决定），卡头一律显示「⏳ 主回合已结束 · 后台子任务运行中（N）」。 */
+export interface BackgroundWaitCardLabel {
+  backgroundTasks: number;
+}
+
+export interface ActivityCardLabel {
+  activity: 'working' | 'tool' | 'model_queue';
+  elapsedSeconds: number;
+  progressAgeSeconds?: number;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
+
+/** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
+function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
+  if (v === true) return 'silent';
+  if (v === 'silent' || v === 'completed' || v === 'failed') return v;
+  return undefined;
+}
+
+/** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
+function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
+  if (status !== 'working' && status !== 'idle') return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
+  return label.backgroundTasks;
+}
+
+/** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
+ *  `silentIdle: true` 时按 'silent' 处理。结构化参数，避免 card-builder 反向依赖 core。 */
+export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: boolean }): IdleCardLabel | undefined {
+  return fc.idleLabel ?? (fc.silentIdle ? 'silent' : undefined);
+}
+
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
+  const backgroundTasks = backgroundWaitCount(status, idleLabel);
+  if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
+    if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
+    if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
+  }
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.
-    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
+    // 'completed': transcript 模式下最终回复卡已投递，卡头改「已完成」。
+    case 'idle': {
+      const label = normalizeIdleLabel(idleLabel);
+      return t(
+        label === 'failed' ? 'card.status.idle_failed'
+          : label === 'completed' ? 'card.status.idle_completed'
+          : label === 'silent' ? 'card.status.idle_silent'
+            : 'card.status.idle',
+        undefined,
+        locale,
+      );
+    }
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -878,9 +1041,17 @@ const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
 
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean; activity?: boolean | StreamCardLabel },
 ): void {
-  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage } = opts;
+  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
+  const activity = opts.activity;
+  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity) {
+    const elapsed = t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
+    const progress = activity.progressAgeSeconds === undefined ? ''
+      : ` · ${t('card.status.activity_progress_age', { seconds: activity.progressAgeSeconds }, locale)}`;
+    elements.push({ tag: 'markdown', element_id: 'botmux_stream_activity', text_size: 'notation_small_v2',
+      content: `<font color='grey'>${elapsed}${progress}</font>` });
+  }
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -894,7 +1065,15 @@ function pushStreamBody(
     if (imageKey) {
       elements.push({ tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true });
     } else {
-      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
+      // A cached image always wins. Without one, say honestly whether a fresh
+      // frame is on its way or cannot arrive (no working capture process /
+      // no provable card target) instead of waiting forever.
+      elements.push({
+        tag: 'markdown',
+        content: t(screenshotUnavailable
+          ? 'card.status.screenshot_unavailable'
+          : 'card.status.waiting_screenshot', undefined, locale),
+      });
     }
     elements.push({ tag: 'hr' });
   }
@@ -904,7 +1083,8 @@ function pushStreamBody(
   const usageSeg = usage
     ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
     : null;
-  if (usageSeg) {
+  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage) : null;
+  if (usageSeg || runtimeSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
     // reads as "one row": when the content is short it's literally one line;
@@ -913,10 +1093,9 @@ function pushStreamBody(
     // on a second line / left-anchored on mobile, which the user found jarring).
     // The trade-off the user accepted: on a long line the runtime is not pinned
     // to the right edge — it simply follows the metrics in reading order. The
-    // runtime self-truncates (model ≤20 chars) so the tail stays compact. No
+    // runtime self-truncates so the tail stays bounded. No
     // runtime → the metrics render alone, unchanged.
-    const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
-    const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    const line = [usageSeg, runtimeSeg].filter(Boolean).join(' · ');
     // 上下文吃紧时整行转红（而不是另起一行报警）：提示就在用量数字旁边，一眼可见，
     // 且不多占卡片高度。判据与 footer 里追加「建议压缩」的**是同一个谓词**——刻意不去
     // 嗅 usageSeg 里有没有那串提示文案：那份文案是可被用户自定义覆盖的（覆盖成空串时
@@ -942,6 +1121,8 @@ function pushStreamBody(
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
  * whenever displayMode !== 'hidden'.
  */
+export const STREAMING_CARD_PATCH_VERSION = '1';
+
 export function buildStreamingCard(
   sessionId: string,
   rootId: string,
@@ -962,7 +1143,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  silentIdle?: boolean,
+  /** 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link StreamCardLabel}。 */
+  silentIdle?: boolean | StreamCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -972,16 +1154,31 @@ export function buildStreamingCard(
    *  degrades to the status quo rather than to a broken button. */
   dshRuntime?: 'official' | 'tui',
   hiddenButtons: readonly StreamingCardButtonId[] = [],
+  /** Screenshot mode with no image: render "no screenshot available" instead
+   *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
+  screenshotUnavailable = false,
+  /** Per-chat substitute toggle. Omitted ⇒ no button (fail-closed). */
+  substituteControl?: SubstituteCardControl,
+  /** Terminal-key grid expanded state, owned by the daemon session and carried
+   *  through every PATCH so streaming refreshes don't snap the grid shut. */
+  keysPanelOpen = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
+  const actionBase = {
+    root_id: rootId,
+    session_id: sessionId,
+    cli_id: effectiveCliId,
+    stream_card_version: STREAMING_CARD_PATCH_VERSION,
+    ...(cardNonce ? { card_nonce: cardNonce } : {}),
+  };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable, activity: silentIdle });
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
@@ -991,124 +1188,184 @@ export function buildStreamingCard(
   // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
   // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
-  // ── Main control row: display toggle, mode toggle, terminal, manage ─────
-  const headerActions: any[] = [];
+  // ── Primary control row: high-frequency / dangerous actions only. The rest
+  //    move into the 「更多操作」 collapsible panel below, so narrow cards (e.g.
+  //    meeting chats) no longer render a dozen full-width buttons stacked into
+  //    one long vertical strip.
+  const primaryActions: any[] = [];
   const hidden = new Set(hiddenButtons);
 
-  if (!hidden.has('output')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'toggle_display', ...actionBase },
-    });
-    if (displayMode !== 'hidden') {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'export_text', ...actionBase },
-      });
-    }
-    if (displayMode === 'screenshot') {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'refresh_screenshot', ...actionBase },
-      });
-    }
-  }
   if (terminalUrl && !hidden.has('terminal')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-      type: 'primary',
-      multi_url: terminalMultiUrl(terminalUrl),
-    });
+    primaryActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
   }
-  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
-  if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.retry_last_task', undefined, locale) },
-      type: 'primary' as const,
-      value: { action: 'retry_last_task', ...actionBase },
-    });
+    primaryActions.push(callbackButton(
+      t('card.btn.retry_last_task', undefined, locale),
+      'primary',
+      { action: 'retry_last_task', ...actionBase },
+    ));
   }
-  if (terminalUrl && !hidden.has('writeLink')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
+  // 「压缩」显示判据必须调谓词，不能手写 cliId 字面量：Builder 与 handler 共用
+  // cliSupportsCompactAction——remote CLI（riff/mojo）无本地终端；无 raw passthrough 面
+  // 的 CLI（codex-app/mira/mir/dsh/ebsd）发 /compact 会被帧协议丢弃或当成普通消息白烧
+  // 一个 turn；MiniMax 经帧协议把 /compact 交给 ACP，同样由该谓词放行，但不开放任意 TUI
+  // passthrough。dshRuntime='tui' 的真交互 TUI 照常显示。handler 侧另有同谓词拒绝兜底。
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && cliSupportsCompactAction(effectiveCliId, { dshRuntime })) {
+    primaryActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
-  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
-  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
-  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
-  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
-  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
-  // 闸门是拿错了判据。
-  //
-  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
-  //   ① remote CLI（riff/mojo）无本地终端可驱动；
-  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
-  //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
-  //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
-  //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
-  //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
-  // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
-  // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'compact_session', ...actionBase },
-    });
-  }
-  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
-  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
-  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
-  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
-  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
+  // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
+  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.stop', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'stop_turn', ...actionBase },
-    });
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
   }
   if (adoptMode) {
     if (showTakeover) {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.takeover', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'takeover', ...actionBase },
-      });
+      primaryActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
     }
     if (!hidden.has('close')) {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-        type: 'danger' as const,
-        value: { action: 'disconnect', ...actionBase },
-      });
+      primaryActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
     }
   } else if (!hidden.has('close')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-      type: 'danger' as const,
-      value: { action: 'close', ...actionBase },
+    primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
+  }
+  if (primaryActions.length > 0) elements.push({ tag: 'action', actions: primaryActions });
+
+  // ── Secondary row + collapsible panels ──────────────────────────────────
+  // The terminal-key grid is a daemon-controlled toggle (state must survive
+  // card PATCHes). The low-frequency controls live in a native Feishu
+  // collapsible_panel with a titled header — an unlabelled overflow "⋯" icon
+  // was not discoverable on mobile. The panel expands locally in the client
+  // (no callback/state needed); its items are one-shot actions, so collapsing
+  // back on the next streaming PATCH is harmless.
+  const keysAvailable = displayMode === 'screenshot' && !isRemoteCliId(cliId);
+  const primaryMode = coordinationModeIsPrimary();
+  if (keysAvailable && !primaryMode) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        // 按钮值带目标状态 desired（而非「翻转」）：连点两下、或卡面与会话状态不一致时，
+        // 点击结果都等于用户看到的那个箭头。
+        callbackButton(
+          `${t('card.btn.keys_panel', undefined, locale)} ${keysPanelOpen ? '▴' : '▾'}`,
+          'default',
+          { action: 'toggle_keys_panel', desired: keysPanelOpen ? 'closed' : 'open', ...actionBase },
+        ),
+      ],
     });
   }
-  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
+  const morePanelButtons: any[] = [];
+  if (!hidden.has('output')) {
+    morePanelButtons.push(callbackButton(
+      t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
+      'default',
+      coordinationModeIsPrimary()
+        ? {
+            action: 'toggle_display',
+            // #2062: carry the visible intent so a durable-lane retry applies
+            // the same mode instead of toggling back.
+            target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+            ...actionBase,
+          }
+        : { action: 'toggle_display', ...actionBase },
+    ));
+    if (displayMode !== 'hidden') {
+      morePanelButtons.push(callbackButton(
+        t('card.btn.export_text', undefined, locale),
+        'default',
+        { action: 'export_text', ...actionBase },
+      ));
+    }
+    if (displayMode === 'screenshot') {
+      morePanelButtons.push(callbackButton(
+        t('card.btn.refresh', undefined, locale),
+        'default',
+        { action: 'refresh_screenshot', ...actionBase },
+      ));
+    }
+  }
+  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
+  if (localBtn) morePanelButtons.push(localBtn);
+  if (terminalUrl && !hidden.has('writeLink')) {
+    morePanelButtons.push(callbackButton(
+      t('card.btn.get_write_link', undefined, locale),
+      'default',
+      { action: 'get_write_link', ...actionBase },
+    ));
+  }
+  // 闲置自动压缩：状态随 usage 快照到卡，快照里没有 ⇒ 该 CLI/后端不支持，不渲染。
+  // 跟随「压缩」的隐藏配置；按钮值带目标状态 desired，重复点击幂等。
+  const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
+  if (idleCompact) {
+    morePanelButtons.push(callbackButton(
+      t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
+      'default',
+      { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
+  // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
+  // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
+  if (!hidden.has('substitute') && substituteControl) {
+    morePanelButtons.push(callbackButton(
+      t(substituteControl.enabled ? 'card.btn.substitute_off' : 'card.btn.substitute_on', undefined, locale),
+      'default',
+      { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
+  if (morePanelButtons.length > 0) {
+    // Two weighted columns keep labels on one line even on a phone-sized card;
+    // an odd last button simply occupies the first column of the final row.
+    const panelRows: any[] = [];
+    for (let i = 0; i < morePanelButtons.length; i += 2) {
+      const pair = morePanelButtons.slice(i, i + 2);
+      panelRows.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        ...(i > 0 ? { margin: '6px 0px 0px 0px' } : {}),
+        columns: pair.map((btn: any) => ({
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'top',
+          elements: [{ ...btn, width: 'fill' }],
+        })),
+      });
+    }
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      margin: '6px 0px 0px 0px',
+      header: {
+        title: { tag: 'plain_text', content: t('card.btn.more_actions', undefined, locale) },
+        icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+        icon_position: 'right',
+        icon_expanded_angle: -180,
+      },
+      elements: panelRows,
+    });
+  }
+  const effortControl = !adoptMode && usage?.reasoningControl;
+  if (effortControl && effortControl.choices.length > 0) {
+    // Display executor truth; keep CAS bound to the saved session setting.
+    const displayedEffort = effortControl.choices.find(effort => effort === usage?.reasoningEffort) ?? effortControl.selected;
+    elements.push({ tag: 'action', actions: [{
+      tag: 'select_static',
+      placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, locale) },
+      ...(displayedEffort ? { initial_option: displayedEffort } : {}),
+      options: effortControl.choices.map(effort => ({
+        text: { tag: 'plain_text', content: `${t('card.effort.select', undefined, locale)}: ${t(`card.effort.${effort}`, undefined, locale)}` },
+        value: effort,
+      })),
+      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
+    }] });
+    const effortScope = effortControl.pending && effortControl.nextTurn
+      ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
+      : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
+        + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: effortScope }] });
+  }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -1120,12 +1377,11 @@ export function buildStreamingCard(
   if (writableTerminalUrl) {
     elements.push({
       tag: 'action',
-      actions: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.open_writable_terminal', undefined, locale) },
-        type: 'primary',
-        multi_url: terminalMultiUrl(writableTerminalUrl),
-      }],
+      actions: [urlButton(
+        t('card.btn.open_writable_terminal', undefined, locale),
+        'primary',
+        terminalMultiUrl(writableTerminalUrl),
+      )],
     });
     elements.push({
       tag: 'note',
@@ -1136,46 +1392,64 @@ export function buildStreamingCard(
     });
   }
 
-  // ── Quick-action keys (only when the screenshot is visible — in text mode
-  //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
-  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
-  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
-  // 以后再加远端 CLI 不会重复漏改。
-  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
+  // ── Terminal-key grid (behind the 「⌨️ 终端按键」 toggle above). Only rendered
+  //    with a visible screenshot — in text mode the keys would fire blindly.
+  //    远端任务后端（riff / mojo）没有可驱动的终端，整组隐藏（isRemoteCliId 单一
+  //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
+  //    fixed grid: the old `action` rows stacked every key full-width on narrow
+  //    cards, which is what made the card a long vertical strip.
+  if (keysAvailable && (primaryMode || keysPanelOpen)) {
     const mkKey = (label: string, key: string) => ({
-      tag: 'button',
-      text: { tag: 'plain_text', content: label },
-      type: 'default' as const,
-      value: { action: 'term_action', ...actionBase, key },
+      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+      width: 'fill' as const,
     });
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('Esc', 'esc'),
-        mkKey('^C', 'ctrlc'),
-        mkKey('Tab', 'tab'),
-        mkKey('␣ Space', 'space'),
-        mkKey('↵ Enter', 'enter'),
-      ],
+    // Row widths are deliberately unequal: Feishu truncates button text with an
+    // ellipsis when a weighted column gets narrower than the label. Labels are
+    // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a
+    // half-width column can't ellipsize one glyph. Esc renders as × (its
+    // common "exit/cancel" glyph); ^C stays textual, already two characters.
+    const keyRow = (keys: Array<{ label: string; key: string }>, topMargin = false) => ({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      ...(topMargin ? { margin: '6px 0px 0px 0px' } : {}),
+      columns: keys.map(({ label, key }) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'top',
+        elements: [mkKey(label, key)],
+      })),
     });
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('←', 'left'),
-        mkKey('↑', 'up'),
-        mkKey('↓', 'down'),
-        mkKey('→', 'right'),
-        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
-        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
-      ],
-    });
+    elements.push(keyRow([
+      { label: '×', key: 'esc' },
+      { label: '^C', key: 'ctrlc' },
+      { label: '⇥', key: 'tab' },
+      { label: '␣', key: 'space' },
+      { label: '↵', key: 'enter' },
+    ]));
+    elements.push(keyRow([
+      { label: '←', key: 'left' },
+      { label: '↑', key: 'up' },
+      { label: '↓', key: 'down' },
+      { label: '→', key: 'right' },
+    ], true));
+    elements.push(keyRow([
+      { label: t('card.btn.half_page_up', undefined, locale), key: 'half_page_up' },
+      { label: t('card.btn.half_page_down', undefined, locale), key: 'half_page_down' },
+    ], true));
   }
 
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({
@@ -1185,14 +1459,17 @@ export function buildStreamingCard(
     });
   }
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
-      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
-    },
+  const card = wideCard({
+    // Lark's ordinary message PATCH endpoint only updates cards whose original
+    // and replacement payloads both opt into shared updates. Streaming cards
+    // are group-visible mutable UI, so this is part of their wire contract.
+    extraConfig: { update_multi: true },
+    header: cardHeader(
+      `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
+      backgroundWait ? BACKGROUND_WAIT_TEMPLATE : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+    ),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1248,7 +1525,11 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Cap backtick runs first: the fence grows with the longest run and is
+      // emitted twice, so a huge run (e.g. 36k backticks) would push the card
+      // past Feishu's size limit even though the body fits its own budget.
+      const capped = text.replace(/`{9,}/g, '`'.repeat(8));
+      const body = truncateContent(capped, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
@@ -1261,26 +1542,15 @@ export function buildPrivateSnapshotCard(
   const actions: any[] = [];
   if (terminalUrl) {
     actions.push(
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-        type: 'primary',
-        multi_url: terminalMultiUrl(terminalUrl),
-      },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-        type: 'default',
-        value: { action: 'get_write_link', ...actionBase },
-      },
+      urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)),
+      callbackButton(
+        t('card.btn.get_write_link', undefined, locale),
+        'default',
+        { action: 'get_write_link', ...actionBase },
+      ),
     );
   }
-  actions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-    type: 'danger',
-    value: { action: 'close', ...actionBase },
-  });
+  actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   elements.push({ tag: 'action', actions });
   elements.push({
     tag: 'note',
@@ -1290,14 +1560,13 @@ export function buildPrivateSnapshotCard(
     }],
   });
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
-      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
-    },
+  const card = wideCard({
+    header: cardHeader(
+      `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}`,
+      STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+    ),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1359,7 +1628,20 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
  *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
  *  many trailing projects to fit the card byte budget; the card then says so.
  *  Callers go through buildRepoSelectCard, which owns the budget. */
-function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
+/** Recovery form of the repo picker: the session's working directory is gone.
+ *  The top row names the missing path and, when git still knows where the
+ *  worktree came from, offers to rebuild it there; switching works as usual
+ *  but keeps the session. */
+export interface RepoSelectRecovery {
+  missingPath: string;
+  /** Branch the deleted worktree had; absent → no rebuild button. */
+  rebuildBranch?: string;
+  /** The session's first message has not started: choosing a directory starts
+   *  it there, so the card asks for a directory rather than a resend. */
+  opening?: boolean;
+}
+
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1380,13 +1662,46 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
       value: p.path,
     }));
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
-    },
+  const card = wideCard({
+    header: recovery
+      ? cardHeaderTemplateFirst('orange', t(recovery.opening ? 'card.repo.recovery_title_opening' : 'card.repo.recovery_title', undefined, locale))
+      : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
+      // Recovery: the missing directory + 「重建 worktree」take the top row. There
+      // is no 「直接开启会话」— the directory it would start in is the one gone.
+      ...(recovery ? [{
+        tag: 'column_set',
+        flex_mode: 'flow',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              larkMdDiv(t(
+                recovery.opening
+                  ? 'card.repo.recovery_missing_opening'
+                  : recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild',
+                { path: escapeMd(recovery.missingPath) },
+                locale,
+              )),
+            ],
+          },
+          ...(recovery.rebuildBranch ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              callbackButton(
+                t('card.btn.rebuild_worktree', { branch: recovery.rebuildBranch }, locale),
+                'primary',
+                { action: 'repo_rebuild_worktree', root_id: rootMessageId ?? '' },
+              ),
+            ],
+          }] : []),
+        ],
+      }] : [
       // Current working directory + 「直接开启会话」on the same row: the skip
       // button means "use this directory as-is, don't pick a repo", so it pairs
       // with the current-dir line rather than the switch dropdown below.
@@ -1405,13 +1720,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              {
-                tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
-                },
-              },
+              larkMdDiv(`${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`),
             ],
           },
           {
@@ -1419,20 +1728,21 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              {
-                tag: 'button',
-                text: { tag: 'plain_text', content: t('card.btn.skip_repo', undefined, locale) },
-                type: 'primary',
-                value: { action: 'skip_repo', root_id: rootMessageId ?? '' },
-              },
+              callbackButton(
+                t('card.btn.skip_repo', undefined, locale),
+                'primary',
+                { action: 'skip_repo', root_id: rootMessageId ?? '' },
+              ),
             ],
           },
         ],
-      },
+      }]),
       {
         tag: 'hr',
       },
-      {
+      // A recovery card is published with whatever the scan finds, possibly
+      // nothing; it then offers manual entry (below) instead of an empty select.
+      ...(options.length > 0 || !recovery ? [{
         tag: 'action',
         actions: [
           {
@@ -1442,7 +1752,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
         ],
-      },
+      }] : []),
       // Worktree open. Two modes, persisted per-bot (worktreeMultiPicker):
       //   • single (default) — instant single-select dropdown + a short 「🔀 多仓库」
       //     button on the SAME action row (a select_static can't live in a
@@ -1465,16 +1775,15 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
           columns: [
             {
               tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-              elements: [{ tag: 'div', text: { tag: 'lark_md', content: t('card.repo.worktree_now_multi', undefined, locale) } }],
+              elements: [larkMdDiv(t('card.repo.worktree_now_multi', undefined, locale))],
             },
             {
               tag: 'column', width: 'auto', vertical_align: 'center',
-              elements: [{
-                tag: 'button',
-                text: { tag: 'plain_text', content: t('card.btn.worktree_to_single', undefined, locale) },
-                type: 'default',
-                value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
-              }],
+              elements: [callbackButton(
+                t('card.btn.worktree_to_single', undefined, locale),
+                'default',
+                { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+              )],
             },
           ],
         }] : []),
@@ -1494,12 +1803,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
           },
           ...(worktreeOptions.length > 1 ? [{
             tag: 'column', width: 'auto', vertical_align: 'center',
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: t('card.btn.worktree_to_multi', undefined, locale) },
-              type: 'default',
-              value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
-            }],
+            elements: [callbackButton(
+              t('card.btn.worktree_to_multi', undefined, locale),
+              'default',
+              { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+            )],
           }] : []),
         ],
       }]) : []),
@@ -1571,12 +1879,16 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
+            content: t(
+              recovery ? (recovery.opening ? 'card.repo.recovery_note_opening' : 'card.repo.recovery_note') : 'card.repo.note',
+              undefined,
+              locale,
+            ),
           },
         ],
       },
     ],
-  };
+  });
 
   return JSON.stringify(card);
 }
@@ -1607,9 +1919,9 @@ export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
  *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
  *  thing before and after a truncation. The scanner sorts repos ahead of
  *  worktrees, so in practice the tail that goes is worktrees. */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, recovery?: RepoSelectRecovery): string {
   const render = (visible: number): string =>
-    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible, recovery);
   const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
 
   const full = render(projects.length);
@@ -1641,13 +1953,24 @@ export interface GrantCardOpts {
   /** 当前卡片暂存的限制；缺省使用产品默认值。 */
   durationMs?: number;
   quota?: number;
+  /** 申请卡转投管理员私聊时的来源：'dm_p2p' = 申请人在私聊里申请；'dm_group' = 群里没有管理员。
+   *  缺省 = 卡片就在原会话里（原行为）。 */
+  delivery?: GrantCardDelivery;
+  /** delivery='dm_group' 时展示的来源群名（查不到时由调用方传占位）。 */
+  chatName?: string;
 }
+
+export type GrantCardDelivery = 'dm_p2p' | 'dm_group';
 
 /** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
-  const body = o.mode === 'request'
+  const body = o.mode === 'request' && o.delivery === 'dm_p2p'
+    ? t('card.grant.body_request_p2p', { name: escapeMd(single?.name ?? '') }, locale)
+    : o.mode === 'request' && o.delivery === 'dm_group'
+    ? t('card.grant.body_request_remote', { name: escapeMd(single?.name ?? ''), chat: escapeMd(o.chatName ?? '') }, locale)
+    : o.mode === 'request'
     ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
@@ -1663,6 +1986,9 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     chat_id: o.chatId,
     nonce: o.nonce,
     mode: o.mode,
+    // 私聊转投的卡：处置时据此选终态文案，并回告原会话里的申请人（申请人看不到这张卡）。
+    ...(o.delivery ? { delivery: o.delivery } : {}),
+    ...(o.delivery === 'dm_group' && o.chatName ? { chat_name: o.chatName } : {}),
   };
   const button = (action: string, text: string, type: string): Record<string, unknown> => ({
     tag: 'button',
@@ -1675,8 +2001,11 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     action_type: 'form_submit',
     value: { action, ...v },
   });
+  const chatBtnKey = o.delivery === 'dm_p2p'
+    ? 'card.grant.btn_chat_p2p'
+    : o.delivery === 'dm_group' ? 'card.grant.btn_chat_remote' : 'card.grant.btn_chat';
   const grantButtons: Array<Record<string, unknown>> = [
-    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
+    button('grant_chat', t(chatBtnKey, undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
     grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
@@ -1685,10 +2014,7 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const card = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'default' },
-    header: {
-      template: 'orange',
-      title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('orange', t('card.grant.title', undefined, locale)),
     body: {
       direction: 'vertical',
       padding: '12px 12px 20px 12px',
@@ -1779,45 +2105,40 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   return JSON.stringify(card);
 }
 
-/** 授权成功后给被授权人的通知卡（独立消息）。支持一次通知多个被授权人；带额度时追加"（额度 N 条）"。
- *
- *  **bot grantee 有名字就用纯文本名字、拿不到名字才 `<at>` 兜底；真人 grantee 一律 `<at>` 点名**：
- *  卡片里的 `<at id=botOpenId>` 会被对方 bot 的 daemon 当成一次「被 @」消息，凭新授权/同伴 peer
- *  关系在本群拉起一个空会话（实测：手动 /grant 后没有 prompt → 空会话「等待输入」）。所以能拿到
- *  bot 名字时优先用纯文本（不产生 mention、不唤醒对方）；只有名字缺失时才退回 `<at>`——此时飞书
- *  能据 open_id 展示对方身份（远比裸 open_id 可读），代价是可能偶尔触发一次空会话（产品上可接受，
- *  且名字缺失是少数边角情况）。真人被 `<at>` 不会自动开会话。传 string/string[]（无 isBot 信息）
- *  时按真人处理（@ 全部），保持旧调用方/单测兼容。 */
-export function buildGrantNotifyCard(
-  kind: 'chat' | 'global',
-  target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
+/** 申请卡转投管理员私聊后，给原会话里申请人的处置结果回告（申请人看不到那张卡）。
+ *  p2p 不 @（会话里只有 ta）；群里 @ 申请人。授权成功带额度/有效期后缀，拒绝不带。 */
+export function buildGrantRequesterNoticeCard(
+  outcome: 'chat' | 'global' | 'deny',
+  delivery: GrantCardDelivery,
+  targets: GrantTargetEntry[],
   locale?: Locale,
   quota?: number,
   expiresAt?: number,
 ): string {
-  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
-    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
-  const at = renderGrantAtMentions(entries);
-  let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
-  if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
-  if (expiresAt !== undefined) {
-    content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  let content: string;
+  if (delivery === 'dm_p2p') {
+    content = t(outcome === 'deny' ? 'card.grant.requester_denied_p2p' : 'card.grant.requester_granted_p2p', undefined, locale);
+  } else {
+    const at = renderGrantAtMentions(targets);
+    content = outcome === 'deny'
+      ? t('card.grant.requester_denied_chat', { at }, locale)
+      : t(outcome === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
-  };
+  if (outcome !== 'deny') {
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
+  const card = wideCard({ elements: [larkMdDiv(content)] });
   return JSON.stringify(card);
 }
 
-/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。 */
-export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale): string {
+/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。
+ *  `autoReapply`：开了 grantRequestToOwnerDm 时，下一条消息会自动再弹申请卡（私聊也会），
+ *  不必让被授权人去「联系 owner 重新 /grant」（私聊陌生人既不知道 owner 是谁也不会用 /grant）。 */
+export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale, autoReapply = false): string {
   const at = `<at id=${targetOpenId}></at>`;
-  const content = t('quota.exhausted_notify', { at, limit }, locale);
-  const card = {
-    config: { wide_screen_mode: true },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
-  };
+  const content = t(autoReapply ? 'quota.exhausted_notify_reapply' : 'quota.exhausted_notify', { at, limit }, locale);
+  const card = wideCard({ elements: [larkMdDiv(content)] });
   return JSON.stringify(card);
 }
 
@@ -1834,27 +2155,14 @@ export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, loc
  */
 export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: CliId | undefined, locale?: Locale): string {
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.adopt_blocked.title', undefined, locale) },
-      template: 'orange',
-    },
-    elements: [
-      { tag: 'markdown', content: t('card.adopt_blocked.body', undefined, locale) },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-            type: 'danger',
-            value: { action: 'close', ...actionBase },
-          },
-        ],
-      },
+  const card = simpleCard({
+    title: t('card.adopt_blocked.title', undefined, locale),
+    template: 'orange',
+    markdown: t('card.adopt_blocked.body', undefined, locale),
+    buttons: [
+      callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }),
     ],
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1944,13 +2252,17 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
-    ? 'card.turn_failed.no_retry'
-    : !o.retryTurnId
-      ? 'card.turn_failed.no_input'
-      : o.retryOffer === 'safe'
-        ? 'card.turn_failed.retry_safe'
-        : 'card.turn_failed.retry_caveated';
+  // 图片尺寸 400 是会话历史被毒化：任何重试/续跑都会带着同一张图再 400，
+  // 必须优先于通用 no_retry 文案，给出 /clear 恢复指引。
+  const adviceKey = o.errorCode === 'provider_image_too_small'
+    ? 'card.turn_failed.image_too_small'
+    : o.retryOffer === 'none'
+      ? 'card.turn_failed.no_retry'
+      : !o.retryTurnId
+        ? 'card.turn_failed.no_input'
+        : o.retryOffer === 'safe'
+          ? 'card.turn_failed.retry_safe'
+          : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -1979,27 +2291,171 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
       },
     });
   }
-  if (o.terminalUrl) {
+  // 小图毒化：普通「继续」会把同一张图再发一遍、必然再 400。单独给一个
+  // primary 动作——worker 先清洗会话记录再 --resume 重启，随后自动续跑，
+  // 文本上下文保留（无需 /clear）。没有失败轮次凭据（retryTurnId）时不给。
+  if (o.errorCode === 'provider_image_too_small' && o.retryTurnId) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-      type: 'default',
-      multi_url: terminalMultiUrl(o.terminalUrl),
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retryTurnId,
+        ...actionBase,
+      },
     });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
   }
   if (actions.length > 0) elements.push({ tag: 'action', actions });
 
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: t(titleKey, { cliName: plainTitle(o.cliName) }, locale),
-      },
-      template: 'red',
-    },
+  return JSON.stringify(wideCard({
+    header: cardHeader(t(titleKey, { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
-  });
+  }));
+}
+
+export interface RecoveryFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** Logical turn the notice is about; pins the retry button to it. */
+  logicalTurnId: string;
+  /** Original sender, @-mentioned first (never a bot). */
+  mentionOpenId?: string;
+  /** i18n key of the human-readable cause (see recoveryCauseI18nKey). */
+  causeKey: string;
+  /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
+  outcomeKey: string;
+  continuations: number;
+  /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
+  errorCodes: string[];
+  task?: string;
+  failedAt?: Date;
+  /** `available` renders the retry button; `retried` replaces it with who
+   *  retried and when; `none` explains why there is nothing to re-deliver. */
+  retry:
+    | { kind: 'available' }
+    | { kind: 'retried'; byOpenId: string; at: Date }
+    /** No re-delivery material, but the session's `lastFailedTurn` is this
+     *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
+     *  continue mode) that recovery cards used to carry. */
+    | { kind: 'continue_legacy'; turnId: string }
+    /** A poisoned-history image failure can be repaired in place even when the
+     *  ordinary recovery notice has no re-delivery envelope. */
+    | { kind: 'purge_images'; turnId: string }
+    | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 自动恢复失败卡：一轮普通消息的自动续跑最终失败（重试用尽 / 续跑结果无法确认 /
+ *  交接被打断……）时发到原群（原话题）的唯一一张卡。
+ *
+ *  与 {@link buildTurnFailedCard} 的区别：
+ *  1. 原因按错误码归类成一句人话（`causeKey`），错误码只作为次要信息附在后面——
+ *     从不出现 provider 原文、堆栈或内部地址；
+ *  2. 「重试」按钮重新投递**这条消息本身**（logical turn 的原始输入，按原发起人身份），
+ *     按钮钉在 logical turn 上，而不是会被后续失败覆盖的 `lastFailedTurn`；
+ *  3. 发起人与管理员都能点（handler 校验），点过后卡片原地换成「已由谁重试」。 */
+export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
+  const { locale } = o;
+  const lines: string[] = [];
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.task) {
+    lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.recovery_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  lines.push(t('card.recovery_failed.field_recovery', {
+    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+  }, locale));
+  const codes = [...new Set(o.errorCodes.filter(Boolean))]
+    .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
+  if (codes.length > 0) {
+    lines.push(t('card.recovery_failed.field_codes', { codes: codes.join(' · ') }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+  const advice = o.retry.kind === 'available'
+    ? t('card.recovery_failed.retry_hint', undefined, locale)
+    : o.retry.kind === 'continue_legacy'
+      ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'purge_images'
+      ? t('card.turn_failed.image_too_small', undefined, locale)
+    : o.retry.kind === 'retried'
+      ? t('card.recovery_failed.retried', {
+        who: `<at id=${o.retry.byOpenId}></at>`,
+        when: o.retry.at.toLocaleTimeString(locale === 'en' ? 'en-US' : 'zh-CN', {
+          hour12: false, hour: '2-digit', minute: '2-digit',
+        }),
+      }, locale)
+      : t(`card.recovery_failed.no_retry_${o.retry.reason}`, undefined, locale);
+  elements.push({ tag: 'markdown', content: advice });
+
+  const actions: any[] = [];
+  if (o.retry.kind === 'available') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_recovery_turn', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'retry_recovery_turn',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+        logical_turn_id: o.logicalTurnId,
+      },
+    });
+  }
+  if (o.retry.kind === 'continue_legacy') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.continue_turn', undefined, locale) },
+      type: 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retry.turnId,
+        mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.retry.kind === 'purge_images') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retry.turnId,
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    elements,
+  }));
 }
 
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
@@ -2028,13 +2484,19 @@ export function buildGrantResultCard(
   quota?: number,
   expiresAt?: number,
   targets?: string | string[] | GrantTargetEntry[],
+  origin?: { delivery?: GrantCardDelivery; chatName?: string },
 ): string {
   let content: string;
   const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
   if (kind !== 'deny' && at) {
     // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
     // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
-    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    // 转投私聊的卡只有管理员看得到，「在本群」说法不成立，改用标明来源的文案。
+    content = kind === 'chat' && origin?.delivery === 'dm_p2p'
+      ? t('card.grant.notify_owner_p2p', { at }, locale)
+      : kind === 'chat' && origin?.delivery === 'dm_group'
+      ? t('card.grant.notify_owner_remote', { at, chat: escapeMd(origin.chatName ?? '') }, locale)
+      : t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
     if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
     if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
   } else {
@@ -2049,7 +2511,7 @@ export function buildGrantResultCard(
   const card = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'default' },
-    header: { template: kind === 'deny' ? 'grey' : 'green', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    header: cardHeaderTemplateFirst(kind === 'deny' ? 'grey' : 'green', t('card.grant.title', undefined, locale)),
     body: { elements: [{ tag: 'markdown', content }] },
   };
   return JSON.stringify(card);
@@ -2117,10 +2579,7 @@ export function buildTuiPromptCard(
   }
 
   const elements: any[] = [
-    {
-      tag: 'div',
-      text: { tag: 'lark_md', content: optionLines },
-    },
+    larkMdDiv(optionLines),
     { tag: 'hr' },
     { tag: 'action', actions: buttons },
   ];
@@ -2155,14 +2614,10 @@ export function buildTuiPromptCard(
     });
   }
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: escapeMd(description) },
-      template: 'orange',
-    },
+  const card = wideCard({
+    header: cardHeader(escapeMd(description), 'orange'),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -2170,19 +2625,11 @@ export function buildTuiPromptCard(
  * Build a "processing" TUI prompt card — shown immediately when user clicks a button.
  */
 export function buildTuiPromptProcessingCard(selectedText: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.executing', undefined, locale) },
-      template: 'blue',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: `${t('card.body.choose_label', undefined, locale)} **${escapeMd(selectedText)}**` },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.executing', undefined, locale),
+    template: 'blue',
+    div: `${t('card.body.choose_label', undefined, locale)} **${escapeMd(selectedText)}**`,
+  });
   return JSON.stringify(card);
 }
 
@@ -2190,38 +2637,124 @@ export function buildTuiPromptProcessingCard(selectedText: string, locale?: Loca
  * Build a resolved TUI prompt card — shows which option was selected.
  */
 export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.selected', undefined, locale) },
-      template: 'green',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: `**${escapeMd(selectedText)}**` },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.selected', undefined, locale),
+    template: 'green',
+    div: `**${escapeMd(selectedText)}**`,
+  });
   return JSON.stringify(card);
 }
 
 /** Build a terminal failure state when worker/backend input was not confirmed. */
 export function buildTuiPromptFailedCard(message: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.failed', undefined, locale) },
-      template: 'red',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: escapeMd(message) },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.failed', undefined, locale),
+    template: 'red',
+    div: escapeMd(message),
+  });
   return JSON.stringify(card);
+}
+
+// ─── Stuck-page cards ────────────────────────────────────────────────────────
+
+/** Code block for terminal text: the fence is longer than any backtick run in
+ *  the body, so screen content cannot close it early. */
+function fencedTerminalText(body: string): string {
+  const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+  const fence = '`'.repeat(Math.max(3, maxRun + 1));
+  return `${fence}\n${body}\n${fence}`;
+}
+
+function pushScreenTail(elements: unknown[], screenTail: string | undefined, locale?: Locale): void {
+  if (!screenTail) return;
+  elements.push(larkMdDiv(t('card.stuck.screen_tail', undefined, locale)));
+  elements.push({ tag: 'markdown', content: fencedTerminalText(screenTail) });
+}
+
+/**
+ * The "CLI is stuck on a blocking page" card. Buttons come from
+ * STUCK_PAGE_CATALOG for `pageType`, one per option, and carry only the
+ * button index and the warning nonce — the daemon maps (page, index) back to
+ * a key on click. An unknown page gets the same card without buttons. There
+ * is no input box: nobody can type through this card.
+ */
+export function buildStuckPageCard(o: {
+  rootId: string;
+  sessionId: string;
+  nonce: number;
+  pageType: string | undefined;
+  cliName: string;
+  /** Already-localised context line (e.g. the notice this card replaces). */
+  noticeText?: string;
+  /** Set for the StuckDetector path: how long the written turn has stalled. */
+  stalledSecs?: number;
+  screenTail?: string;
+  /** Whether a turn initiator was identified (changes who-may-press hint). */
+  hasInitiator: boolean;
+  /** Global switch `stuckCardInitiatorKeys` at build time; false = the hint
+   *  says operators only, whoever started the turn. Absent = on. */
+  initiatorKeysEnabled?: boolean;
+  locale?: Locale;
+}): string {
+  const locale = o.locale;
+  const spec = stuckPageSpec(o.pageType);
+  const lines: string[] = [];
+  if (o.noticeText) lines.push(escapeMd(o.noticeText));
+  if (o.stalledSecs !== undefined) lines.push(escapeMd(t('card.stuck.stalled', { secs: String(o.stalledSecs) }, locale)));
+  lines.push(escapeMd(t(spec ? spec.descriptionKey : 'card.stuck.page.unknown', undefined, locale)));
+  const elements: unknown[] = [larkMdDiv(lines.join('\n\n'))];
+  pushScreenTail(elements, o.screenTail, locale);
+  if (spec && spec.options.length > 0) {
+    elements.push({ tag: 'hr' });
+    const hintKey = o.initiatorKeysEnabled === false
+      ? 'card.stuck.hint.operators_only'
+      : o.hasInitiator ? 'card.stuck.hint.initiator' : 'card.stuck.hint.admin_only';
+    elements.push(larkMdDiv(escapeMd(t(hintKey, undefined, locale))));
+    const buttons = spec.options.map((option, index) => callbackButton(
+      t(option.labelKey, undefined, locale)
+        + (option.audience === 'admin' ? t('card.stuck.admin_suffix', undefined, locale) : ''),
+      option.audience === 'initiator' ? 'primary' : 'default',
+      {
+        action: 'stuck_key',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        selected_index: String(index),
+        nonce: String(o.nonce),
+      },
+    ));
+    elements.push({ tag: 'action', actions: buttons });
+  }
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.title', { cliName: o.cliName }, locale), 'orange'),
+    elements,
+  }));
+}
+
+/** Result of a stuck-card key press: what was sent and what the screen showed
+ *  afterwards (bounded plain-text tail when the worker could read it). */
+export function buildStuckKeyResultCard(
+  resultText: string,
+  afterScreenTail: string | undefined,
+  stillBlocked: boolean,
+  locale?: Locale,
+): string {
+  const elements: unknown[] = [larkMdDiv(`**${escapeMd(resultText)}**`)];
+  pushScreenTail(elements, afterScreenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.result_title', undefined, locale), stillBlocked ? 'orange' : 'green'),
+    elements,
+  }));
+}
+
+/** An `input_not_submitted` notice together with the bottom of the terminal,
+ *  so the reader sees why the message did not go in without opening it. */
+export function buildInputNotSubmittedCard(message: string, screenTail: string, locale?: Locale): string {
+  const elements: unknown[] = [larkMdDiv(escapeMd(message))];
+  pushScreenTail(elements, screenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.notice_title', undefined, locale), 'orange'),
+    elements,
+  }));
 }
 
 // ─── Adopt cards ─────────────────────────────────────────────────────────────
@@ -2306,6 +2839,22 @@ function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefine
       .toLowerCase();
     return haystack.includes(q);
   });
+}
+
+/**
+ * "Show all" button for the no-match state of the search pickers (relay /
+ * quote / adopt). Re-fires the picker's own `*_search` action; a button click
+ * has no `input_value`, so the handler reads the query as '' and re-renders
+ * the full list.
+ */
+function buildClearSearchButton(value: Record<string, unknown>, locale?: Locale): any {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.picker.btn_clear_search', undefined, locale) },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{ type: 'callback', value }],
+  };
 }
 
 /**
@@ -2431,8 +2980,13 @@ export function buildRelayPickerCard(
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
-      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+      content: t('card.relay.empty_filtered', { query: escapeMd(searchQuery) }, locale),
     });
+    // Without this the only way back to the full list is to clear the input
+    // and submit an empty string, which Lark won't fire — the card dead-ends.
+    // A button click carries no input_value, so the relay_search handler
+    // resolves it to '' and re-renders the unfiltered list.
+    elements.push(buildClearSearchButton({ action: 'relay_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
@@ -2615,10 +3169,7 @@ function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale) },
-      template: 'blue',
-    },
+    header: cardHeader(t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale), 'blue'),
     body: { direction: 'vertical', elements },
   };
 }
@@ -2728,7 +3279,8 @@ export function buildQuotePickerCard(
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
   if (filtered.length === 0) {
-    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'quote_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
 
@@ -2845,10 +3397,7 @@ function wrapQuoteCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.quote.title', undefined, locale) },
-      template: 'blue',
-    },
+    header: cardHeader(t('card.quote.title', undefined, locale), 'blue'),
     body: { direction: 'vertical', elements },
   };
 }
@@ -2871,9 +3420,16 @@ export interface AdoptPickerEntry {
    *  Deterministic so a re-render (which re-discovers) reproduces the same key. */
   key: string;
   kind: AdoptEntryKind;
+  /** Live backend shown in the source field. Resume rows have no live backend. */
+  liveBackend?: 'tmux' | 'Zellij' | 'Herdr' | 'Orca';
   cliId?: CliId;
   cliDisplayName?: string;
-  /** resume: first user prompt; live: project (cwd basename). */
+  /** resume: the CLI's native title when the transcript has one, else the
+   *  first real user prompt (see ResumableSession.title); live: backend /
+   *  CLI display name (herdr pane label / Claude terminal title / TraeX native
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title; herdr
+   *  entries whose tab was found are named after it, see herdrTabTitle) or the
+   *  Orca terminal title, else project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2883,6 +3439,10 @@ export interface AdoptPickerEntry {
   sessionId?: string;
   /** live: tmux/zellij/herdr target label. */
   target?: string;
+  /** live herdr: workspace name shown ahead of `target` on the Location line. */
+  targetWorkspace?: string;
+  /** Search-only text, never rendered (live herdr: workspace and tab names). */
+  searchAliases?: string[];
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
   /** One-based position among history candidates, for same-screen disambiguation. */
@@ -2902,9 +3462,35 @@ export interface AdoptPickerEntry {
  *  匹配"): (zellijSession, zellijPaneId) already uniquely identifies the pane.
  *  tmux/herdr keep adoptTargetKey (tmux includes pid, herdr does not) — tmux's
  *  confirm fast-path parses the trailing pid, and that path is unchanged. */
-export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
+function isOrcaAdoptCandidate(
+  s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession,
+): s is OrcaAdoptableSession {
+  return 'source' in s && s.source === 'orca';
+}
+
+export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession): string {
+  if (isOrcaAdoptCandidate(s)) return `live:orca:${s.orcaTerminalHandle}`;
   if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}`;
   return `live:${adoptTargetKey(s)}`;
+}
+
+/** Title of a live herdr entry named after its tab. Alone in the tab: pane
+ *  label > the tab's given name > native title (Claude: terminal title, else
+ *  first prompt) > the tab's default name. Sharing the tab with other entries
+ *  of this card: `<tab> · <pane label | native title | untitled>`. Undefined
+ *  unless the picker's enrichment found the tab; the caller then keeps the
+ *  discovery title exactly as before. */
+function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string): string | undefined {
+  if (s.source !== 'herdr' || !s.herdrTabLabel || s.herdrTabAutoNamed === undefined) return undefined;
+  const groupKey = herdrTabGroupKey(s);
+  const native = s.herdrNativeTitle ?? s.herdrFirstPrompt;
+  if ((groupKey ? tabGroups.get(groupKey) ?? 0 : 0) > 1) {
+    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? untitled);
+  }
+  return s.herdrPaneLabel
+    ?? (s.herdrTabAutoNamed ? undefined : s.herdrTabLabel)
+    ?? native
+    ?? s.herdrTabLabel;
 }
 
 /** Fold both adopt sources into one uniform entry list. Live entries come
@@ -2916,26 +3502,46 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): stri
  *  CLI, so the caller knows it), and the user wants to see "Codex" on each
  *  history row rather than a blank. */
 export function buildAdoptEntries(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
+  locale?: Locale,
 ): AdoptPickerEntry[] {
   const customName = runtimeDisplayName?.trim();
+  const tabGroups = countHerdrTabGroups(sessions);
+  const untitledLive = t('card.adopt.untitled_live', undefined, locale);
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
-    const target = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
+    const title = isOrcaAdoptCandidate(s)
+      ? s.orcaTerminalTitle || project
+      : s.title || project;
+    let target: string | undefined;
+    if (isOrcaAdoptCandidate(s)) target = undefined;
+    else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
+    else target = adoptTargetLabel(s);
+    // Only herdr / tmux entries carry herdr names; zellij and Orca never do.
+    const herdrLike = isOrcaAdoptCandidate(s) || zellij ? undefined : s;
+    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive) : undefined;
+    const workspace = herdrLike?.herdrWorkspaceLabel;
+    const tabName = herdrLike?.herdrTabAutoNamed !== undefined ? herdrLike.herdrTabLabel : undefined;
+    const aliases = [workspace, tabName].filter((a): a is string => !!a);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
+      liveBackend: isOrcaAdoptCandidate(s)
+        ? 'Orca'
+        : zellij ? 'Zellij' : s.source === 'herdr' ? 'Herdr' : 'tmux',
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: project,
+      title: tabTitle ?? title,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
       target,
+      ...(workspace ? { targetWorkspace: workspace } : {}),
+      ...(aliases.length > 0 ? { searchAliases: aliases } : {}),
       timeMs: s.startedAt,
     };
   });
@@ -2966,14 +3572,15 @@ export interface AdoptPickerState {
 const ADOPT_PICKER_PAGE_SIZE = 5;
 const ADOPT_SEARCH_FIELD = 'adopt_search_q';
 
-/** Case-insensitive substring over title / project / cwd / cliId / sessionId.
- *  Empty query matches everything. Includes sessionId so a user who knows the
- *  id can type it and jump straight to the entry. */
+/** Case-insensitive substring over title / project / cwd / cliId / sessionId /
+ *  target and the search-only aliases (herdr workspace / tab names, which the
+ *  title may not show). Empty query matches everything. Includes sessionId so a
+ *  user who knows the id can type it and jump straight to the entry. */
 function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefined): AdoptPickerEntry[] {
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target]
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target, ...(e.searchAliases ?? [])]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -2991,7 +3598,7 @@ function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefine
  * knows to narrow via search instead of assuming they saw everything.
  */
 export function buildAdoptSelectCard(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
   resumable?: ResumableSession[],
@@ -3001,14 +3608,13 @@ export function buildAdoptSelectCard(
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName, locale);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;
   const elements: any[] = [];
 
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
-  const sessionUnknown = t('card.adopt.session_unknown', undefined, locale);
 
   // Truncation hint: resume discovery caps at resumeLimit; if it came back
   // full, the user is probably not seeing everything → tell them to search.
@@ -3064,8 +3670,9 @@ export function buildAdoptSelectCard(
     // markdown element, so an unescaped `![](http://x)` would render as an
     // image (external fetch = tracking beacon / SSRF surface). Neutralising
     // [ ] ` etc. defuses that. (buildRelayPickerCard echoes its query the
-    // same way and shares the same latent risk — tracked separately.)
+    // same way and now escapes it too.)
     elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'adopt_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 
@@ -3081,8 +3688,12 @@ export function buildAdoptSelectCard(
   // ─── Session cards (current page) ───────────────────────────────────
   visible.forEach((e) => {
     const isSelected = e.key === selectedKey;
+    // 既有后端（tmux/Zellij/Herdr）的「来源」行保持原样，避免改变老用户卡片形态；
+    // 仅 Orca 作为实验能力追加后端名与实验性标记（后端身份仍可从「位置」行看出）。
     const kindTag = e.kind === 'live'
-      ? t('card.adopt.kind_live', undefined, locale)
+      ? (e.liveBackend === 'Orca'
+        ? `${t('card.adopt.kind_live', undefined, locale)} · Orca${t('card.adopt.orca_experimental_suffix', undefined, locale)}`
+        : t('card.adopt.kind_live', undefined, locale))
       : t('card.adopt.kind_resume', undefined, locale);
     const cliName = e.cliDisplayName ?? (e.cliId ? getCliDisplayName(e.cliId) : '—');
     const timeLabel = e.kind === 'live'
@@ -3098,10 +3709,15 @@ export function buildAdoptSelectCard(
       titleLine,
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
-      `${labelDir}: \`${escapeMd(e.cwd)}\``,
+      `${labelDir}: ${inlineCode(e.cwd)}`,
     ];
     if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
-    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
+    if (e.kind === 'live' && e.target) {
+      const target = inlineCode(e.target);
+      lines.push(`${labelTarget}: ${e.targetWorkspace
+        ? t('card.adopt.location_with_workspace', { workspace: escapeMd(e.targetWorkspace), target }, locale)
+        : target}`);
+    }
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
       tag: 'interactive_container',
@@ -3187,10 +3803,7 @@ function wrapAdoptCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('blue', t('card.adopt.title', undefined, locale)),
     body: { direction: 'vertical', elements },
   };
 }
@@ -3223,17 +3836,10 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     };
   });
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.codex_app_thread.title', undefined, locale) },
-    },
+  const card = wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.codex_app_thread.title', undefined, locale)),
     elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: t('card.codex_app_thread.subtitle', undefined, locale) },
-      },
+      larkMdDiv(t('card.codex_app_thread.subtitle', undefined, locale)),
       {
         tag: 'action',
         actions: [
@@ -3246,6 +3852,6 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
         ],
       },
     ],
-  };
+  });
   return JSON.stringify(card);
 }

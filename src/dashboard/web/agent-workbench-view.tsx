@@ -1,4 +1,5 @@
 import type React from 'react';
+import { botDisplayName } from './ui.js';
 import {
   useCallback,
   useEffect,
@@ -23,7 +24,6 @@ import {
   workbenchPreviewHref,
   type WorkbenchGroupDimension,
   type WorkbenchLayoutState,
-  type WorkbenchPaneKind,
   type WorkbenchSessionRow,
   type WorkbenchTerminalLocation,
 } from './agent-workbench-model.js';
@@ -252,7 +252,6 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): React.JSX.El
   const appearanceTermStyle = useWorkbenchAppearanceRoot().appearance.termStyle;
   const [appearanceSheetOpen, setAppearanceSheetOpen] = useState(false);
   const responsive = deriveResponsiveWorkbenchLayout(viewportWidth, layout);
-  const chatSplitActive = responsive.chatMode === 'native-split' && layout.chatRequested;
   const forcedRailCollapsed = responsive.railCollapsed;
   const railWidth = forcedRailCollapsed ? WORKBENCH_RAIL_COLLAPSED : layout.railWidth;
 
@@ -556,7 +555,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): React.JSX.El
         <div className="wb-workspace-title">
           <span>
             <strong title={String(selected.title || selected.sessionId)}>{String(selected.title || selected.sessionId)}</strong>
-            <small>{selected.botName || selected.larkAppId || 'Bot'} · {selected.cliId || '未知'} · {selected.repoName || '无仓库'}</small>
+            <small>{selected.botName || selected.larkAppId ? botDisplayName(selected) : 'Bot'} · {selected.cliId || '未知'} · {selected.repoName || '无仓库'}</small>
           </span>
         </div>
         <div className="wb-workspace-controls">
@@ -609,12 +608,6 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): React.JSX.El
       <p>{selectedSessionId ? '该会话已结束或被清理' : '从左侧列表选择会话，查看终端或网页预览'}</p>
     </section>
   );
-
-  const mobileContent = mobilePage === 'sessions'
-    ? sessionList
-    : mobilePage === 'info' && selected
-      ? <main className="wb-mobile-info"><WorkbenchInfo session={selected} /></main>
-      : workspace;
 
   return (
     <main

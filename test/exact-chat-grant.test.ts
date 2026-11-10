@@ -219,7 +219,13 @@ describe('exact chat grant service', () => {
       ['cli_pm'],
     );
     expect(fixture.deps.listCurrentChatBotMembers).toHaveBeenCalledWith('cli_receiver', 'oc_chat');
-    expect(fixture.deps.addChatGrant).toHaveBeenCalledWith('cli_receiver', 'oc_chat', 'ou_peer_a');
+    expect(fixture.deps.addChatGrant).toHaveBeenCalledWith(
+      'cli_receiver',
+      'oc_chat',
+      'ou_peer_a',
+      undefined,
+      undefined,
+    );
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalledWith(
       'cli_receiver',
       'oc_chat',
@@ -277,6 +283,22 @@ describe('exact chat grant service', () => {
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
   });
 
+  it('resolve by stable app id: returns the open_id the receiver sees, writes nothing; revoke by app id stays refused', async () => {
+    const result = await applyExactChatGrantByLarkAppIds({
+      operation: 'resolve',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    }, fixture.deps);
+    expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).toHaveBeenCalledWith('cli_receiver', 'oc_chat', ['cli_pm']);
+    expect(result).toMatchObject({ ok: true, operation: 'resolve', grantsTalk: false, subjects: [], subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }] });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+    expect(fixture.deps.removeChatGrant).not.toHaveBeenCalled();
+    expect(await applyExactChatGrantByLarkAppIds({
+      operation: 'revoke', receiverLarkAppId: 'cli_receiver', chatId: 'oc_chat', subjectLarkAppIds: ['cli_pm'],
+    }, fixture.deps)).toMatchObject({ ok: false, error: 'subject_lark_app_ids_grant_only' });
+  });
+
   it('allows stable app ids only for grants and validates them before resolution', async () => {
     expect(await applyExactChatGrantByLarkAppIds({
       operation: 'readback',
@@ -304,5 +326,109 @@ describe('exact chat grant service', () => {
       subjectLarkAppIds: tooMany,
     }, fixture.deps)).toMatchObject({ ok: false, error: 'too_many_subject_lark_app_ids' });
     expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).not.toHaveBeenCalled();
+  });
+});
+
+describe('exact chat grant quota/duration forwarding', () => {
+  let fixture: ReturnType<typeof makeDeps>;
+
+  beforeEach(() => {
+    fixture = makeDeps();
+  });
+
+  it('forwards quota and converts relative durationMs to an absolute expiresAt (shared anchor)', async () => {
+    const durationMs = 60_000;
+    const before = Date.now();
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_peer_a', 'ou_peer_b'],
+      quota: 7,
+      durationMs,
+    }, fixture.deps);
+    const after = Date.now();
+
+    expect(result.ok).toBe(true);
+    const add = vi.mocked(fixture.deps.addChatGrant);
+    expect(add).toHaveBeenCalledTimes(2);
+    const firstExpires = add.mock.calls[0]?.[4] as number;
+    for (const call of add.mock.calls) {
+      expect(call[0]).toBe('cli_receiver');
+      expect(call[1]).toBe('oc_chat');
+      expect(call[3]).toBe(7);
+      // One anchor for the whole batch: both subjects see the same expiresAt.
+      expect(call[4]).toBe(firstExpires);
+      expect(call[4]).toBeGreaterThanOrEqual(before + durationMs - 2_000);
+      expect(call[4]).toBeLessThanOrEqual(after + durationMs + 2_000);
+    }
+  });
+
+  it('omits both extras when quota/durationMs are absent (CLI byte-identical shape)', async () => {
+    const result = await applyExactChatGrant({ ...base, operation: 'grant' }, fixture.deps);
+    expect(result.ok).toBe(true);
+    const add = vi.mocked(fixture.deps.addChatGrant);
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(add.mock.calls[0]?.[3]).toBeUndefined();
+    expect(add.mock.calls[0]?.[4]).toBeUndefined();
+  });
+
+  it('treats non-finite/non-positive quota or duration as unlimited rather than throwing', async () => {
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      quota: '5',
+      durationMs: 0,
+    }, fixture.deps);
+    expect(result.ok).toBe(true);
+    const add = vi.mocked(fixture.deps.addChatGrant);
+    expect(add.mock.calls[0]?.[3]).toBeUndefined();
+    expect(add.mock.calls[0]?.[4]).toBeUndefined();
+
+    vi.clearAllMocks();
+    const negative = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      quota: -3,
+      durationMs: Number.NaN,
+    }, fixture.deps);
+    expect(negative.ok).toBe(true);
+    expect(vi.mocked(fixture.deps.addChatGrant).mock.calls[0]?.slice(3)).toEqual([undefined, undefined]);
+  });
+
+  it('floors a fractional quota', async () => {
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      quota: 7.9,
+    }, fixture.deps);
+    expect(result.ok).toBe(true);
+    expect(vi.mocked(fixture.deps.addChatGrant).mock.calls[0]?.[3]).toBe(7);
+  });
+
+  it('forwards quota/durationMs through the stable app-id entry point', async () => {
+    const durationMs = 30_000;
+    const before = Date.now();
+    const result = await applyExactChatGrantByLarkAppIds({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+      quota: 9,
+      durationMs,
+    }, fixture.deps);
+    const after = Date.now();
+
+    expect(result.ok).toBe(true);
+    const add = vi.mocked(fixture.deps.addChatGrant);
+    expect(add).toHaveBeenCalledWith(
+      'cli_receiver',
+      'oc_chat',
+      'ou_peer_a',
+      9,
+      expect.any(Number),
+    );
+    const expiresAt = add.mock.calls[0]?.[4] as number;
+    expect(expiresAt).toBeGreaterThanOrEqual(before + durationMs - 2_000);
+    expect(expiresAt).toBeLessThanOrEqual(after + durationMs + 2_000);
   });
 });

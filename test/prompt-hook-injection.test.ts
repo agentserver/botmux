@@ -6,6 +6,9 @@
  *   - off / 不支持的 CLI / preflight 失败 → inline（历史行为）
  * Run: pnpm vitest run test/prompt-hook-injection.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks（与 prompt-builder.test.ts 同一套） ─────────────────────────────
@@ -59,12 +62,19 @@ vi.mock('../src/im/lark/client.js', () => ({
 const getBotMock = vi.fn(() => ({
   config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
 }));
+// core/reply-delivery.ts 读 per-bot replyDelivery 的入口。本文件的 hook 注入用例都以
+// **显式 send** 为前提（claude-code 未配置时缺省已是 transcript、不注入 reminder——
+// 见下方 transcript 用例），所以 mock 缺省返回显式 'send' 而非 undefined。
+const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' | undefined => 'send');
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
   getAllBots: vi.fn(() => []),
+  resolveReplyDelivery: (...args: unknown[]) => replyDeliveryMock(...args),
+  getOwnerOpenId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -100,7 +110,8 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 
 // ─── 被测模块 ──────────────────────────────────────────────────────────────
 
-import { buildFollowUpCliInput, buildNewTopicCliInput } from '../src/core/session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, promptHookRunsInCli } from '../src/core/session-manager.js';
+import { DEFAULT_CLAUDE_DATA_DIR } from '../src/adapters/cli/claude-code.js';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
@@ -252,6 +263,37 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
+  it.each([
+    { name: 'sandbox: "oncall"', config: { sandbox: 'oncall' as const }, env: undefined, perBot: true },
+    { name: 'BOTMUX_SANDBOX=oncall', config: {}, env: 'oncall', perBot: true },
+    { name: 'sandbox: "scratch"', config: { sandbox: 'scratch' as const }, env: undefined, perBot: false },
+    { name: 'sandbox: true + BOTMUX_SANDBOX=scratch', config: { sandbox: true }, env: 'scratch', perBot: false },
+  ])('$name：与 worker 同口径，只有 oncall 改查 BOT_HOME 的 settings', ({ config, env, perBot }) => {
+    vi.stubEnv('BOTMUX_SANDBOX', env);
+    try {
+      getBotMock.mockReturnValue({
+        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, ...config },
+      });
+      preflightMock.mockClear();
+      buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+      expect(preflightMock).toHaveBeenCalledTimes(1);
+      const checkedPath = preflightMock.mock.calls[0][0] as string;
+      const botHomeSettings = '/tmp/bots/app_test/claude/settings.json';
+      if (perBot) expect(checkedPath).toBe(botHomeSettings);
+      else expect(checkedPath).not.toBe(botHomeSettings);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('BOTMUX_SANDBOX 非法值：不做 preflight，回退 inline', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'yes');
+    try {
+      preflightMock.mockClear();
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+      expect(preflightMock).not.toHaveBeenCalled();
+      expect(result.content).toContain('<botmux_reminder>');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
@@ -270,6 +312,61 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  // ─── replyDelivery=transcript：续轮不注入 reminder，sidecar 不再承载它 ────────
+
+  it('auto + transcript + whiteboard：sidecar 含 whiteboard 与 sender，reminder 两边都没有', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_t' }));
+      // hook 模式下 PTY 文本只剩用户正文，外壳与 sender/mentions 都进 sidecar。
+      expect(result.content).toBe('帮我修个 bug');
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(result.content).not.toContain('<whiteboard');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toBeDefined();
+      expect(envelope).toContain('<whiteboard');
+      expect(envelope).toContain('<sender ');
+      expect(envelope).not.toContain('<botmux_reminder>');
+      // 白板末句改口：不再要求「仍必须 botmux send」。
+      expect(envelope).toContain('用户可见结论写进最终回复即可');
+      expect(envelope).not.toContain('仍必须');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('auto + transcript 无 whiteboard：envelope 只剩 sender，仍走 hook（reminder 两边都没有）', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe('帮我修个 bug');
+      expect(result.content).not.toContain('<botmux_reminder>');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toContain('<sender ');
+      expect(envelope).not.toContain('<botmux_reminder>');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('未显式配置 + claude-code：缺省即 transcript，与显式 transcript 字节相同（无 reminder）', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    let explicit: string;
+    try {
+      explicit = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined })).content;
+    } finally {
+      replyDeliveryMock.mockReturnValue(undefined);
+    }
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe(explicit);
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
   });
 });
 
@@ -400,5 +497,51 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(rescued).toBeDefined();
     expect(rescued).toContain('<sender ');
     expect(rescued).toContain('<mentions>');
+  });
+});
+
+describe('promptHookRunsInCli — the UserPromptSubmit hook runs on every submit of the session\'s CLI', () => {
+  let prevDataDir: string | undefined;
+  beforeEach(() => {
+    prevDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' } as never,
+    });
+    preflightMock.mockReset();
+    preflightMock.mockReturnValue(true);
+  });
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = prevDataDir;
+  });
+  const target = (overrides: Record<string, unknown> = {}) => ({
+    cliId: 'claude-code' as const, sessionBackendType: 'tmux' as const, larkAppId: LARK_APP_ID, ...overrides,
+  });
+
+  it('claude-code on this host with the hook in the settings it reads — whether or not hook injection is on', () => {
+    expect(promptHookRunsInCli(target())).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith(`${DEFAULT_CLAUDE_DATA_DIR}/settings.json`);
+    preflightMock.mockReturnValue(false);
+    expect(promptHookRunsInCli(target())).toBe(false);
+  });
+
+  it('looks where the CLI reads: its config profile, or the per-bot copy under read isolation', () => {
+    expect(promptHookRunsInCli(target({ cliConfigDir: '/profiles/work' }))).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith('/profiles/work/settings.json');
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true } as never,
+    });
+    expect(promptHookRunsInCli(target())).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith('/tmp/bots/app_test/claude/settings.json');
+  });
+
+  it('never for a CLI that does not install it, a backend not on this host or not known, or a bot not known', () => {
+    for (const cliId of ['seed', 'relay', 'codex', 'cursor'] as const) expect(promptHookRunsInCli(target({ cliId }))).toBe(false);
+    expect(promptHookRunsInCli(target({ sessionBackendType: 'riff' }))).toBe(false);
+    expect(promptHookRunsInCli(target({ sessionBackendType: undefined }))).toBe(false);
+    expect(preflightMock).not.toHaveBeenCalled();
+    getBotMock.mockImplementation(() => { throw new Error('unknown bot'); });
+    expect(promptHookRunsInCli(target())).toBe(false);
   });
 });

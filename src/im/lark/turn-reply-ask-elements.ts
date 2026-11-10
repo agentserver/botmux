@@ -1,13 +1,26 @@
+import { hasAskForm } from '../../core/ask-form.js';
+import { buildAskFormElements } from './ask-form-elements.js';
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
+import { stripCardMarkdownImages } from './md-card.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot } from './ask-option-layout.js';
+import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
+import { buildAskCustomForm } from './ask-custom-form.js';
+import { optionDescriptions } from './ask-option-descriptions.js';
+import { permissionAskSettleStatus } from './ask-permission-status.js';
 
-const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+const safe = (text: string) => stripCardMarkdownImages(text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]'))
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-/** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
+/** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0.
+ * Option descriptions render in full: replyCardAskTarget only embeds asks whose whole
+ * questions JSON fits in 3000 bytes, so they cannot crowd out the reply card. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
-  const submit = ask.questions.length > 1 || ask.questions.some(q => q.multiSelect);
+  if (hasAskForm(ask.questions)) return buildAskFormElements(ask, locale, entry.result);
+  if (supportsAskCustomInput(ask)) return [buildAskCustomForm(ask, locale, entry.confirmEmptyArmed, safe)];
+  const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
+  const submit = textReplyRequired || ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];
   const button = (label: string, value: Record<string, string>, type = 'default') => ({
     tag: 'button', text: { tag: 'plain_text', content: label }, type,
@@ -16,26 +29,43 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   const row = (buttons: Array<Record<string, any>>) => ({ tag: 'column_set', flex_mode: 'flow', columns: buttons.map(b => ({
     tag: 'column', width: 'auto', elements: [b],
   })) });
-  ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: safe(q.prompt) });
-    const selected = new Set(ask.selections?.[i] ?? []);
-    const buttons = q.options.map(option => ({
-      ...button(option.label,
-        { action: submit ? 'ask_toggle' : 'ask_select', key: option.key, question_index: String(i) },
-        selected.has(option.key) ? 'primary' : 'default',
-      ),
-      ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
-    }));
-    for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+  // vertical：与独立卡同款的一行一按钮（单列 weighted、不被同排挤压）。内嵌形态是
+  // Card JSON 2.0，字段形态与独立卡 1.0 不同，不能复用 appendActionRows。
+  const verticalRow = (b: Record<string, any>) => ({
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'small',
+    columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [b] }],
   });
-  if (submit) {
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
+  ask.questions.forEach((q, i) => {
+    elements.push({ tag: 'markdown', content: safe(textReplyRequired && q.options.length
+      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt) });
+    // A text batch keeps no buttons: it is answered with one text reply.
+    if (!textReplyRequired) {
+      const selected = new Set(ask.selections?.[i] ?? []);
+      const buttons = q.options.map(option => ({
+        ...button(option.label,
+          { action: submit ? 'ask_toggle' : 'ask_select', key: option.key, question_index: String(i) },
+          selected.has(option.key) ? 'primary' : 'default',
+        ),
+        ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
+      }));
+      if (optionLayout === 'vertical') {
+        for (const b of buttons) elements.push(verticalRow(b));
+      } else {
+        for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+      }
+    }
+    const details = optionDescriptions(q, locale);
+    if (details) elements.push({ tag: 'markdown', text_size: 'notation', content: details.content });
+  });
+  if (submit && !textReplyRequired) {
     if (entry.confirmEmptyArmed) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
     elements.push(row([button(t(entry.confirmEmptyArmed ? 'card.ask.submit_confirm_empty' : 'card.ask.submit', undefined, locale), {
       action: 'ask_submit', ...(entry.confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
     }, entry.confirmEmptyArmed ? 'danger' : 'primary')]));
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
-    t('card.ask.custom_reply_hint', undefined, locale),
+    t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
     `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });
@@ -46,12 +76,15 @@ export function turnReplyAskSummary(entry: ReplyCardAsk, locale: Locale = 'zh'):
   const { ask, result } = entry;
   const lines = ask.questions.map((q, i) => {
     const labels = result?.kind === 'answered'
-      ? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
+      ? result.customAnswers?.[i] ?? result.inputs?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
     return `🙋 ${safe(q.prompt)}${labels ? `\n✓ ${safe(labels)}` : ''}`;
   });
+  const permission = result ? permissionAskSettleStatus(ask, result, locale) : undefined;
   if (result?.kind === 'answered') {
     if (result.comment) lines.push(`💬 ${safe(result.comment)}`);
-    else if (result.answers.every(keys => keys.length === 0)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
+    else if (!result.inputs?.some(Boolean) && !result.customAnswers?.some(Boolean) && result.answers.every(keys => keys.length === 0)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
+  } else if (permission) {
+    lines.push(`${permission.headline}\n${permission.detail}`);
   } else {
     lines.push(result?.kind === 'timedOut' ? t('card.ask.timed_out', undefined, locale)
       : result?.kind === 'invalidated' ? t('card.ask.invalidated', undefined, locale)

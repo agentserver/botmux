@@ -1,3 +1,6 @@
+import { resolveSessionModelPinView } from './session-model.js';
+import type { modelPinView } from './model-pin.js';
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -6,13 +9,20 @@
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
-import type { Session, StreamStatus } from '../types.js';
+import type { SessionLastTurn } from './session-task-status.js';
+import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { topicResumeBlockReason } from './topic-session-continuity.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
-import { getBotBrand } from '../bot-registry.js';
+import { getBot, getBotBrand } from '../bot-registry.js';
+import { sessionSandboxDrift, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { type Brand, chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
-import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
+import { getSessionUsageWithContext, type SessionTokenUsage } from './cost-calculator.js';
+import { buildContextUsage } from './session-context-usage.js';
+import type { ObserveContext } from '../services/session-observe.js';
+import { readStatuslineSnapshot } from '../services/statusline-snapshot.js';
+import { config } from '../config.js';
 import { readSessionOpenTodos } from '../services/todo-state.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
 import { safeSessionPreviewTarget, type SessionPreviewTarget } from './session-preview.js';
@@ -24,13 +34,33 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  modelPin?: ReturnType<typeof modelPinView>;
+  /** Closed rows only: whether a new message in the topic will resume this session. */
+  resumable?: boolean;
+  /** Closed rows only: why it will not be resumed (e.g. user_closed). */
+  resumeBlockedReason?: string;
+  /** See Session.continuity. */
+  continuity?: Session['continuity'];
+  /** Present only when the session's frozen sandbox mode differs from what the
+   *  bot's CURRENT config would give a new session (dashboard badge). */
+  sandboxDrift?: { session: SandboxMode; current: SandboxMode };
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  /** Only populated once the worker has actually observed the runtime (i.e. the
+   *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
+   *  "requested-as-effective" fallback: consumers that need pre-observation
+   *  intent must read requestedLaunch. */
+  effectiveRuntime?: {
+    model: string; reasoningEffort?: string;
+    workerGeneration?: number; observedAt?: string;
+  };
   /** Concrete distribution identity frozen on the session. Older path-only
    * sessions expose a basename-derived legacy identity. */
   runtimeId?: string;
@@ -56,6 +86,8 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  /** Explicit whiteboard binding; absent when the session is unbound. */
+  whiteboardId?: Session['whiteboardId'];
   headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
@@ -68,6 +100,8 @@ export interface SessionRow extends SessionMessagePreview {
   /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
    *  未设置时前端按运行状态推导默认列。 */
   kanbanColumn?: string;
+  /** 手动放置列的时刻；之后任务状态变化即失效（见 web/kanban-model.ts）。 */
+  kanbanColumnAt?: number;
   kanbanPosition?: number;
   /** Locked sessions are protected from dashboard idle cleanup. */
   locked?: boolean;
@@ -101,7 +135,11 @@ export interface SessionRow extends SessionMessagePreview {
    *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
    *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
    *  which a silent raise never bumps. Feeds the needs-you column. */
-  agentAttention?: { kind: string; reason: string; at: number };
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** 最近一轮的结果（core/session-task-status.ts）。缺失 = 读不到，前端归空闲。 */
+  lastTurn?: SessionLastTurn;
+  /** 当前忙碌段的起点（进入 starting/working/analyzing 的边沿），只在活跃会话上有。 */
+  busySinceAt?: number;
   /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
    *  与运行态正交——「运行态=空闲 + 有未完成 todo」正是要抓的「机器停了活没干完」。
    *  仅 Claude / Codex 家族能提取；其它 CLI、无 transcript、从未建 todo 时为 undefined
@@ -109,6 +147,11 @@ export interface SessionRow extends SessionMessagePreview {
   openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean; items: Array<{ status: string; text: string }> };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
+  /** How full the context is right now (latest request's prompt size, window,
+   *  compactions). Computed together with `tokenUsage` from the same transcript
+   *  read, so it is absent whenever token scans are skipped (bulk lists) or the
+   *  CLI/transcript cannot prove a measurement. Feeds `botmux observe`. */
+  contextUsage?: ObserveContext;
   /** Worker process PID, active rows only. Used by dashboard resource attribution. */
   workerPid?: number;
   /** Persisted row intentionally kept active but detached from daemon routing
@@ -128,6 +171,29 @@ export interface SessionRow extends SessionMessagePreview {
   repoName?: string;
   /** Current branch of workingDir; absent for detached HEAD / non-repo. */
   gitBranch?: string;
+  /** Per-turn reply anchors — `botmux send` prefers these over the topic root. */
+  replyTargets?: Record<string, ReplyTargetEntry>;
+  currentReplyTarget?: Session['currentReplyTarget'];
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+}
+
+function composeSendRoutingFields(
+  s: Session,
+  runtimeCurrentReplyTarget?: Session['currentReplyTarget'],
+): Pick<
+  SessionRow,
+  'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
+> {
+  const currentReplyTarget = runtimeCurrentReplyTarget ?? s.currentReplyTarget;
+  return {
+    ...(s.replyTargets ? { replyTargets: s.replyTargets } : {}),
+    ...(currentReplyTarget ? { currentReplyTarget } : {}),
+    ...(s.quoteTargetId ? { quoteTargetId: s.quoteTargetId } : {}),
+    ...(s.quoteTargetSenderOpenId ? { quoteTargetSenderOpenId: s.quoteTargetSenderOpenId } : {}),
+    ...(s.codexAppDispatchLedger ? { codexAppDispatchLedger: s.codexAppDispatchLedger } : {}),
+  };
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -140,6 +206,16 @@ function sessionThreadLink(
 ): string | undefined {
   if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
   return threadAppLink(session.chatId, session.larkThreadId, brand);
+}
+
+// The native Lark topic id is a durable identity fact for thread-scope sessions.
+// Row producers publish it so downstream normalizers (including botmux observe)
+// can surface `identity.threadId` without re-deriving the validation rule.
+function sessionThreadId(
+  session: Pick<Session, 'scope' | 'larkThreadId'>,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return session.larkThreadId;
 }
 
 function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
@@ -167,14 +243,34 @@ export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
 }
 
-function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage | null {
-  return getSessionTokenUsage({
-    cliId: s.cliId ?? 'unknown',
+interface SessionRowUsage {
+  tokenUsage: SessionTokenUsage | null;
+  contextUsage?: ObserveContext;
+}
+
+/** One transcript read (via the shared stat/incremental cache) feeds both the
+ *  cumulative token totals and the context gauge — never two scans. */
+function readSessionRowUsage(s: Session, workingDir?: string): SessionRowUsage {
+  const cliId = s.cliId ?? 'unknown';
+  const { snapshot, contextObservation } = getSessionUsageWithContext({
+    cliId,
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir ?? s.workingDir,
     larkAppId: s.larkAppId,
   });
+  // A Remote Runner transcript lives behind the provider boundary; the
+  // daemon-host resolver would be reading the wrong filesystem.
+  if (s.backendType === 'remote-runner') return { tokenUsage: snapshot.tokens };
+  let statuslineWindowTokens: number | undefined;
+  if (cliId === 'claude-code') {
+    // Claude's transcript only names the model, never its window; the window is
+    // whatever the statusline last reported (undefined once that is stale).
+    try { statuslineWindowTokens = readStatuslineSnapshot(config.session.dataDir, s.sessionId)?.contextWindowTokens; }
+    catch { /* best-effort: the window is optional */ }
+  }
+  const contextUsage = buildContextUsage({ snapshot, contextObservation, statuslineWindowTokens });
+  return { tokenUsage: snapshot.tokens, ...(contextUsage ? { contextUsage } : {}) };
 }
 
 function sessionOpenTodos(s: Session, workingDir?: string, fresh?: boolean): SessionRow['openTodos'] {
@@ -212,6 +308,11 @@ function backendSessionNameForRow(s: Session): string | undefined {
   ).sessionName;
 }
 
+function closedResumabilityFields(s: Session): Pick<SessionRow, 'resumable' | 'resumeBlockedReason'> {
+  const blocked = s.scope === 'chat' ? 'chat_scope' : topicResumeBlockReason(s);
+  return blocked ? { resumable: false, resumeBlockedReason: blocked } : { resumable: true };
+}
+
 function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runtimeDisplayName'> {
   if (s.cliRuntime) {
     return { runtimeId: s.cliRuntime.id, runtimeDisplayName: s.cliRuntime.displayName };
@@ -221,6 +322,21 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
     if (legacyName) return { runtimeId: legacyName, runtimeDisplayName: legacyName };
   }
   return {};
+}
+
+function modelPinField(s: Session, ds?: DaemonSession): Pick<SessionRow, 'modelPin'> {
+  if (!s.modelPin) return {};
+  let cfg: { cliId?: string } | undefined;
+  try { cfg = getBot(s.larkAppId!).config; } catch { /* orphan */ }
+  return { modelPin: resolveSessionModelPinView(ds ?? { session: s }, cfg as Parameters<typeof resolveSessionModelPinView>[1]) };
+}
+
+function sandboxDriftField(s: Session): Pick<SessionRow, 'sandboxDrift'> {
+  if (s.sandbox === undefined || !s.larkAppId) return {};
+  let botCfg: Parameters<typeof sessionSandboxDrift>[1];
+  try { botCfg = getBot(s.larkAppId).config; } catch { return {}; }
+  const drift = sessionSandboxDrift(s.sandbox, botCfg);
+  return drift ? { sandboxDrift: drift } : {};
 }
 
 export interface DashboardRowOptions {
@@ -234,28 +350,37 @@ export interface DashboardRowOptions {
   includeTokenUsage?: boolean;
 }
 
-function maybeSessionTokenUsage(
+function maybeSessionRowUsage(
   s: Session,
   workingDir: string | undefined,
   opts?: DashboardRowOptions,
   opts2?: { usePersistedSnapshot?: boolean },
-): SessionTokenUsage | null {
-  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return s.tokenUsage;
-  return opts?.includeTokenUsage === false ? null : sessionTokenUsage(s, workingDir);
+): SessionRowUsage {
+  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return { tokenUsage: s.tokenUsage };
+  return opts?.includeTokenUsage === false ? { tokenUsage: null } : readSessionRowUsage(s, workingDir);
 }
 
 export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
+  const topicId = sessionThreadId(ds.session);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.continuity ? { continuity: ds.session.continuity } : {}),
+    ...(ds.session.dispatchLaunchSpec ? {
+      requestedLaunch: ds.session.dispatchLaunchSpec.requested,
+      ...(ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
     creationSource: ds.session.creationSource,
     ...sessionRuntimeFields(ds.session),
+    ...modelPinField(ds.session, ds),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
     // For every other session, process residency is authoritative: suspension
@@ -280,6 +405,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    whiteboardId: ds.session.whiteboardId,
     headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
@@ -287,6 +413,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     backendType: ds.session.backendType,
     backendSessionName: backendSessionNameForRow(ds.session),
     kanbanColumn: ds.session.kanbanColumn,
+    kanbanColumnAt: ds.session.kanbanColumnAt,
     kanbanPosition: ds.session.kanbanPosition,
     locked: !!ds.session.locked,
     // Read from the persisted Session — single source of truth.
@@ -303,33 +430,53 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     hasHistory: ds.hasHistory,
     feishuChatLink: sessionFeishuChatLink(ds.session, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
     agentAttention: ds.agentAttention
-      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      ? {
+          kind: ds.agentAttention.kind,
+          reason: ds.agentAttention.reason,
+          at: ds.agentAttention.at,
+          ...(ds.agentAttention.source ? { source: ds.agentAttention.source } : {}),
+        }
       : undefined,
-    tokenUsage: maybeSessionTokenUsage(ds.session, ds.workingDir, opts),
+    ...(ds.session.lastTurn ? { lastTurn: ds.session.lastTurn } : {}),
+    ...(ds.busySinceAt !== undefined ? { busySinceAt: ds.busySinceAt } : {}),
+    ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...sandboxDriftField(ds.session),
     ...buildSessionMessagePreview(ds.session),
+    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
   };
 }
 
 export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
+    ...modelPinField(s),
     status: 'closed',
+    ...closedResumabilityFields(s),
+    ...(s.continuity ? { continuity: s.continuity } : {}),
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
     lastMessageAt: s.closedAt ? (parseSessionTime(s.closedAt) ?? sessionLastActivityAtMs(s)) : sessionLastActivityAtMs(s),
@@ -341,6 +488,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -348,6 +496,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     backendType: s.backendType,
     backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
+    kanbanColumnAt: s.kanbanColumnAt,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
@@ -355,8 +504,10 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
-    tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
+    ...(topicId ? { threadId: topicId } : {}),
+    ...maybeSessionRowUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }
 
@@ -371,15 +522,23 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
 export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
+    ...modelPinField(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
@@ -391,6 +550,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -398,16 +558,21 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     backendType: s.backendType,
     backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
+    kanbanColumnAt: s.kanbanColumnAt,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: null,
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     queued: !!s.queued,
+    ...(s.lastTurn ? { lastTurn: s.lastTurn } : {}),
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
-    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
+    ...sandboxDriftField(s),
+    ...maybeSessionRowUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }

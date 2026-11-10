@@ -14,13 +14,17 @@
  * (so the ownership probe has a live pid to enumerate) and assert the RESULT is
  * B — not merely "not A", which a permanently-wedged bridge would also satisfy.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
+import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
+import { codexHistorySidIsOwned, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 
 const SID_A = '019dd80d-d922-7a11-8339-0208d8c5b4ec'; // foreign sibling pane
 const SID_B = '019dd80d-d922-7a11-8339-0208d8c5b4ee'; // this pane (owned)
@@ -51,7 +55,7 @@ function fakePty(cliPid: number | undefined, onEnter?: () => void): PtyHandle {
   return {
     write() {},
     pasteText() {},
-    sendSpecialKeys() { onEnter?.(); },
+    submitBracketedPaste() { onEnter?.(); },
     ...(cliPid !== undefined ? { cliPid } : {}),
   } as unknown as PtyHandle;
 }
@@ -108,6 +112,9 @@ describe('codex writeInput history ownership filter', () => {
     expect((result as any).submitted).toBe(true);
     // The heart of the fix: B's writeInput binds to B, never to A.
     expect((result as any).cliSessionId).toBe(SID_B);
+    // Positive ownership (owned rollout set available and containing B) is the
+    // only history evidence that may become a native input consumption receipt.
+    expect((result as any).ownershipProven).toBe(true);
   });
 
   it('recognizes rollouts under a custom CODEX_HOME (env-independent path shape), when worker + Codex share that home', async () => {
@@ -139,24 +146,24 @@ describe('codex writeInput history ownership filter', () => {
   it('does not wedge when ONLY the foreign line exists yet — waits, then binds B once B lands', async () => {
     const historyPath = join(home, 'history.jsonl');
     const adapter = createCodexAdapter();
-    // The first Enter only exposes A. Once writeInput has rejected that foreign
-    // match and exhausted its first bounded wait, its retry is the observable
-    // happens-before boundary that publishes B. This preserves the intended
-    // "foreign first, owned later" ordering without racing a wall-clock timer.
-    let enterCount = 0;
-    const onEnter = () => {
-      enterCount += 1;
-      if (enterCount === 1) {
+    vi.useFakeTimers();
+    try {
+      let enterCount = 0;
+      const onEnter = () => {
+        enterCount += 1;
         appendFileSync(historyPath, historyLine(SID_A, 'ping'));
-      } else if (enterCount === 2) {
-        appendFileSync(historyPath, historyLine(SID_B, 'ping'));
-      }
-    };
-
-    const result = await adapter.writeInput!(fakePty(ownerChild.pid!, onEnter), 'ping');
-    // Must NOT have taken A; must eventually bind B (not a permanent no-match).
-    expect((result as any)?.cliSessionId).toBe(SID_B);
-    expect(enterCount).toBe(2);
+        // A separate async history writer exposes B later; receipt latency
+        // must never require another submit key.
+        setTimeout(() => appendFileSync(historyPath, historyLine(SID_B, 'ping')), 15);
+      };
+      const pending = adapter.writeInput!(fakePty(ownerChild.pid!, onEnter), 'ping');
+      await flushFakeTimers(100, 1);
+      const result = await pending;
+      expect((result as any)?.cliSessionId).toBe(SID_B);
+      expect(enterCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('with NO pid, preserves accept-first semantics (single-pane / pid-less callers unchanged)', async () => {
@@ -169,6 +176,55 @@ describe('codex writeInput history ownership filter', () => {
 
     const result = await adapter.writeInput!(fakePty(undefined, onEnter), 'noping');
     expect((result as any)?.cliSessionId).toBe(SID_A);
+    // Submit semantics unchanged, but an unfiltered match proves no ownership.
+    expect((result as any)?.ownershipProven).toBeUndefined();
+  });
+
+  it('with an unavailable ownership enumeration, still submits but never proves ownership (no consumption receipt)', async () => {
+    const historyPath = join(home, 'history.jsonl');
+    const adapter = createCodexAdapter();
+    // A pid whose open-file enumeration fails (not our child; a dead pid) models
+    // the documented lsof/proc failure branch: the submit is accepted for
+    // compatibility while its session identity remains unproven.
+    const onEnter = () => { appendFileSync(historyPath, historyLine(SID_A, 'unowned')); };
+    const deadPid = 2_147_000_000;
+    const result = await adapter.writeInput!(fakePty(deadPid, onEnter), 'unowned');
+    expect((result as any)?.submitted).toBe(true);
+    expect((result as any)?.ownershipProven).toBeUndefined();
+    expect((result as any)?.cliSessionId).toBeUndefined();
+    // Only a candidate the caller must prove before using.
+    expect((result as any)?.unprovenCliSessionId).toBe(SID_A);
+  });
+
+  // Codex creates the rollout at the first submit, and its history line can be
+  // readable before the pid holds that rollout (#2363). The id must not become
+  // the session, but it must reach the caller as a candidate: dropping it left
+  // a fresh spawn with no way to find its rollout.
+  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set, returning the id only as a candidate', async (timing) => {
+    expect(findCodexRolloutSetByPid(process.pid)).toEqual(new Set());
+    const pty = fakePty(process.pid, () => {
+      if (timing === 'immediate') {
+        appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
+      }
+    });
+    let draft = '';
+    const submitFrame = pty.submitBracketedPaste!;
+    pty.submitBracketedPaste = text => { draft = text; return submitFrame(text); };
+    pty.captureInputState = () => ({
+      viewport: `\n» ${draft || 'Ask Codex to do anything'}\n\n  gpt-6-astra ultra · ~/work · Main [default]`,
+      cursor: { x: 2 + draft.length, y: 1 },
+    });
+
+    const result = await createCodexAdapter().writeInput(pty, 'shared submit');
+
+    if (timing === 'late') {
+      if (!result || result.submitted !== false) throw new Error('Expected a pending submission');
+      appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
+      expect(result.recheck?.()).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
+    } else {
+      expect(result).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
+    }
+    expect(codexHistorySidIsOwned(SID_A, findCodexRolloutSetByPid(process.pid))).toBe(false);
   });
 
   it('external App Server viewer accepts only its explicitly selected remote thread', async () => {
@@ -190,5 +246,41 @@ describe('codex writeInput history ownership filter', () => {
     const result = await adapter.writeInput!(pty, 'remote submit');
     expect((result as any)?.submitted).toBe(true);
     expect((result as any)?.cliSessionId).toBe(SID_A);
+    // The explicitly selected thread is positive ownership evidence.
+    expect((result as any)?.ownershipProven).toBe(true);
+  });
+
+  it('managed Codex: the worker wiring predicate hands the real backend pid to the adapter, which then proves ownership', async () => {
+    const historyPath = join(home, 'history.jsonl');
+    // The worker wires `backend.cliPid` only for adapters the predicate names; a
+    // CLI missing from it (as codex once was) submits fine but never proves.
+    expect(cliAdapterBindsOwnershipPid('codex', undefined)).toBe(true);
+    expect(cliAdapterBindsOwnershipPid('traex', undefined)).toBe(true);
+    expect(cliAdapterBindsOwnershipPid('opencode', undefined)).toBe(false);
+    expect(cliAdapterBindsOwnershipPid('opencode', '/tmp/claude-data')).toBe(true);
+    // A real tmux backend handle that never touches tmux: every input path is
+    // redirected to the temporary history, as the managed worker would see it.
+    const handle = new TmuxPipeBackend('review-do-not-connect', { isReattach: true, ownsSession: true }) as TmuxPipeBackend & PtyHandle;
+    handle.getChildPid = () => ownerChild.pid!;
+    handle.write = () => true;
+    let draft = '';
+    handle.pasteText = text => { draft = text; };
+    handle.captureInputState = () => ({
+      viewport: `› ${draft || 'Ask Codex to do anything'}\nmodel · /tmp · Ready`,
+      cursor: { x: 2 + draft.length, y: 0 },
+    });
+    let content = 'managed owned submit';
+    handle.submitBracketedPaste = () => { appendFileSync(historyPath, historyLine(SID_B, content)); draft = ''; };
+    // Before wiring: submitted, but no ownership proof is possible.
+    const unwired = await createCodexAdapter().writeInput!(handle, content);
+    expect((unwired as any)?.submitted).toBe(true);
+    expect((unwired as any)?.ownershipProven).toBeUndefined();
+    // The worker's synchronous/delayed wiring, gated by the shared predicate.
+    if (cliAdapterBindsOwnershipPid('codex', undefined)) handle.cliPid = handle.getChildPid()!;
+    content = 'managed owned submit after wiring';
+    const wired = await createCodexAdapter().writeInput!(handle, content);
+    expect((wired as any)?.submitted).toBe(true);
+    expect((wired as any)?.cliSessionId).toBe(SID_B);
+    expect((wired as any)?.ownershipProven).toBe(true);
   });
 });

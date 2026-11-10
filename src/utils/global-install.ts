@@ -47,11 +47,28 @@ function normalized(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '');
 }
 
-/** Node resolves pnpm 11's global botmux symlink to this store realpath. */
+/** PNPM_HOME as exported and as resolved. The store path is a realpath, so a
+ * PNPM_HOME spelled through a symlinked home only matches once resolved. */
+function pnpmHomeSpellings(): string[] {
+  const raw = process.env.PNPM_HOME ?? '';
+  let resolved = '';
+  try {
+    if (raw) resolved = realpathSync(raw);
+  } catch {
+    // A missing PNPM_HOME can only match as spelled.
+  }
+  return [raw, resolved].map(p => normalized(p).toLowerCase()).filter(p => p !== '');
+}
+
+/** Node resolves pnpm 11's global botmux symlink to this store realpath. The
+ * store lives under PNPM_HOME, which only the default location names `pnpm`. */
 function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
-  return root.match(
-    /^(.*\/pnpm)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
+  const match = root.match(
+    /^(.*)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
   );
+  if (!match) return null;
+  const base = match[1].toLowerCase();
+  return base.endsWith('/pnpm') || pnpmHomeSpellings().includes(base) ? match : null;
 }
 
 function pnpmGlobalDir(
@@ -277,7 +294,7 @@ export function resolveAutoUpdateSupport(
   strategy: UpdateStrategy,
 ): { supported: boolean; plan: GlobalInstallPlan | null } {
   if (strategy.kind === 'self-replace') return { supported: true, plan: null };
-  if (strategy.kind === 'unsupported') return { supported: false, plan: null };
+  if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') return { supported: false, plan: null };
   const plan = tryResolveGlobalInstallPlan(strategy.packageRoot);
   return { supported: plan !== null, plan };
 }
